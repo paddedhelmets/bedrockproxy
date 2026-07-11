@@ -1,0 +1,153 @@
+# bedrockproxy
+
+Advertise any **remote** Minecraft Bedrock server as a **LAN game** on your local
+network, so devices that can't add external servers by address — Xbox,
+PlayStation, Switch — discover and join it from the Friends / LAN tab.
+
+This is a self-hosted, ad-free replacement for the **BedrockTogether** phone app,
+run as a small persistent service on a device that lives on the same LAN as the
+consoles (a Raspberry Pi, mini-PC, or always-on box). One static binary.
+
+## Why this exists
+
+Consoles lock Bedrock's "Servers" tab to a Microsoft-curated list. The only way
+for a Switch/PS5/Xbox to reach *your* server is via the **LAN / Friends** tab.
+BedrockTogether solves that by running on a phone on the family Wi-Fi and
+spoofing a LAN game. `bedrockproxy` does the same job, but:
+
+- runs **persistently** on a cheap box on the LAN (no phone to keep charged/open),
+- is a single cross-compiled binary with **no ads and no telemetry**,
+- is configurable and scriptable.
+
+## How it works
+
+The proxy listens on the Bedrock port (UDP `19132`) on the LAN. For each console
+that probes the LAN it does two things:
+
+1. **Spoofed discovery** — answers RakNet `ID_UNCONNECTED_PING` broadcasts with a
+   `PONG` whose MOTD advertises your chosen remote server (it mirrors the remote's
+   real protocol/version so consoles never reject it as "outdated").
+2. **Transparent relay** — for every other datagram (the actual RakNet game
+   session: connection handshake, framed data, ECDH/AES handshake bytes), it
+   shuttles bytes between the console and the remote server verbatim.
+
+A relay is *required*, not optional: a RakNet pong has no address field, so the
+console connects back to the **source IP of the pong** — i.e. the proxy — which
+must then forward the traffic to the real server. Verified across the original
+RakNet, JRakNet, go-raknet, and CloudburstMC. See
+[`docs/reference-bedrock-lan-spoof.md`](docs/reference-bedrock-lan-spoof.md) for
+the byte-exact protocol spec.
+
+```
+ family LAN (e.g. sibling's Wi-Fi)                  internet
+ ──────────────────────────────────                ────────────────
+ console ──UDP──> bedrockproxy:19132 ──UDP/NAT──>  remote Bedrock server
+ (Switch/Xbox/PS5)  │ spoofs LAN pong              (your VPS / dad's box)
+                    └ relays game datagrams both ways, per console
+```
+
+> **Important:** the proxy must run on a device **on the target LAN**. A cloud
+> box that isn't on the consoles' broadcast domain can't do LAN discovery —
+> physics, not a limitation of this tool.
+
+## Build
+
+Requires Go 1.22+.
+
+```sh
+go build -o bedrockproxy .          # the proxy
+go build -o bedping ./cmd/bedping   # the ping/debug client
+```
+
+## Run
+
+```sh
+./bedrockproxy --remote dad.example.com:19132 --motd "Granddad's World"
+```
+
+Flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--remote` | *(required)* | Remote Bedrock server `host:port` to advertise & relay to. |
+| `--bind` | `:19132` | LAN-facing UDP listen address. |
+| `--motd` | *(mirror remote)* | MOTD line 1 shown in the server list. |
+| `--sub-motd` | *(mirror remote)* | MOTD line 2 (subtitle). |
+| `--protocol` | *(mirror remote)* | Protocol version number; override only if you know it. |
+| `--refresh` | `60s` | Re-probe the remote's MOTD (player counts, version) every N; `0` = once. |
+| `--idle-timeout` | `5m` | Drop idle console sessions after this long. |
+| `--dns-listen` | *(off)* | Enable **Switch mode**: UDP address for the DNS server (e.g. `:53`). Empty = off. |
+| `--dns-target-ip` | *(auto)* | IP returned for pinned featured-server domains (the proxy's LAN IP). |
+| `--dns-upstream` | `1.1.1.1:53` | Upstream resolver for non-pinned queries (keeps the rest of the LAN resolving). |
+
+By default the advertised protocol/version **mirror the remote server**, so as
+long as your consoles and the remote run the same Bedrock version they'll join
+cleanly.
+
+## Deploy to a family LAN (the common case)
+
+On a Pi / mini-PC on the consoles' network:
+
+```sh
+# Download the matching build from https://github.com/paddedhelmets/bedrockproxy/releases
+# (or build from source: GOOS=linux GOARCH=arm64 go build .)
+./bedrockproxy --remote dad.example.com:19132 --motd "Granddad's World"
+```
+
+Or as a systemd service (see `deploy/bedrockproxy.service`). That's it — every
+Bedrock client on that LAN now sees the game under LAN/Friends.
+
+## Nintendo Switch (DNS mode)
+
+The Switch can't be reached by LAN broadcast (Nintendo restricts it to its own
+Local Wireless radio). It can, however, connect to the **Featured Servers** list —
+whose hostnames it resolves via DNS. The DNS mode resolves those hostnames to the
+proxy, so a Switch clicking a featured server connects to the proxy and is relayed
+to your remote server, exactly like the other consoles.
+
+Run the proxy with DNS enabled (needs UDP 53; the systemd unit grants
+`CAP_NET_BIND_SERVICE`):
+
+```sh
+sudo ./bedrockproxy --remote dad.example.com:19132 --dns-listen :53
+```
+
+Then point Switches at the DNS — **two ways, same proxy**:
+
+- **Per-Switch:** set each Switch's primary DNS to the proxy's LAN IP (secondary
+  `1.1.1.1`). Most control, per device.
+- **LAN-wide (zero per-Switch config):** set the router's DNS (or the DHCP-advertised
+  DNS) to the proxy's LAN IP. Every Switch on the LAN is redirected automatically;
+  non-pinned queries are forwarded upstream so the rest of the LAN keeps working.
+
+The pinned domains are the five current Bedrock featured servers (`hivebedrock.network`,
+`play.inpvp.net`, `mco.lbsg.net`, `play.galaxite.net`, `play.enchanted.gg`). If your
+family hit "Switch shows Coming Soon / can't connect", the usual culprits are IPv6
+bypassing the IPv4 DNS (disable IPv6 on the router, or the Switch falls back to an
+IPv6 resolver you don't control) — set the Switch's DNS explicitly as a fallback.
+
+## Platform support & caveats
+
+| Platform | LAN relay |
+|----------|-----------|
+| Win10/11, iOS, Android | ✅ (can also add servers manually) |
+| Xbox | ✅ |
+| PS4 / PS5 | ✅ (PS5 has a known LAN-detection quirk, MCPE-239057) |
+| **Switch** | ✅ via DNS mode (`--dns-listen :53`) — no LAN broadcast on Switch; it reaches the proxy through the Featured Servers list |
+
+The proxy advertises on the standard Bedrock broadcast (`255.255.255.255:19132`).
+
+## Roadmap
+
+- [x] Spoofed RakNet pong (discovery)
+- [x] Transparent UDP relay (full game session)
+- [x] Remote MOTD mirroring
+- [x] **Switch DNS mode** — featured-server redirect, per-Switch or LAN-wide (router DNS)
+- [x] Cross-compiled release binaries (linux arm64/amd64, macOS, windows)
+- [ ] Proactive LAN pong broadcaster (faster discovery for some clients)
+- [ ] Real-console hardware validation (Switch via DNS; Xbox/PS via LAN)
+- [ ] Optional web/TUI status (sessions, bandwidth)
+
+## License
+
+MIT — see [LICENSE](LICENSE). Matches the RakNet libraries it interoperates with.

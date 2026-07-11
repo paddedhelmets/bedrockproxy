@@ -1,0 +1,41 @@
+[Unit]
+Description=Bedrock LAN-Spoof Proxy (ad-free BedrockTogether replacement)
+Documentation=https://github.com/paddedhelmets/bedrockproxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as an unprivileged user. Create it (or change to an existing one):
+#   sudo useradd -r -s /usr/sbin/nologin bedrockproxy
+User=bedrockproxy
+Group=bedrockproxy
+
+# Edit deploy/bedrockproxy.env (REMOTE is required).
+EnvironmentFile=/etc/bedrockproxy/bedrockproxy.env
+ExecStart=/usr/local/bin/bedrockproxy \
+    --remote "${REMOTE}" \
+    --motd "${MOTD}" \
+    --bind "${BIND}" \
+    --dns-listen "${DNS_LISTEN}" \
+    --dns-target-ip "${DNS_TARGET_IP}" \
+    --dns-upstream "${DNS_UPSTREAM}"
+
+# Restart on crash; the relay is stateless so this is safe.
+Restart=on-failure
+RestartSec=5s
+
+# Hardening: the proxy needs UDP 19132 on the LAN and outbound UDP only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+# CAP_NET_BIND_SERVICE lets the DNS mode bind UDP 53 (Switch mode). Harmless if unused.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

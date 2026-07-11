@@ -1,0 +1,5 @@
+/bedrockproxy
+/bedping
+/bedconnect
+*.exe
+/dist/
