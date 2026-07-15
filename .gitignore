@@ -3,3 +3,7 @@
 /bedconnect
 *.exe
 /dist/
+# large uploads / pack exports live here transiently; never commit
+*.zip
+*.mcpack
+*.mcaddon

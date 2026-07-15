@@ -92,6 +92,13 @@ func normalize(d string) string {
 func (s *Server) Serve(ctx context.Context) error {
 	s.log.Printf("dns server up on %s: pinning %d domain(s) -> %s, forwarding rest to %s",
 		s.conn.LocalAddr(), len(s.pinned), s.firstPinnedIP(), s.upstream)
+	// Close the socket on shutdown so the ReadFromUDP below unblocks and the
+	// process exits cleanly on Ctrl-C / SIGTERM.
+	go func() {
+		<-ctx.Done()
+		s.log.Printf("dns shutting down...")
+		s.conn.Close()
+	}()
 	buf := make([]byte, bufLen)
 	for {
 		n, client, err := s.conn.ReadFromUDP(buf)

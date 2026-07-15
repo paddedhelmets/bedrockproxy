@@ -125,6 +125,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.log.Printf("bedrockproxy up: %s -> %s (serverID=%d, proto=%s motd=%q)",
 		s.cfg.BindAddr, s.cfg.RemoteAddr, s.serverID, s.motd.ProtocolVersion, s.motd.Motd)
 
+	// Closing the socket on shutdown unblocks the ReadFromUDP below so that
+	// Ctrl-C / SIGTERM exits the process cleanly instead of hanging.
+	go func() {
+		<-ctx.Done()
+		s.log.Printf("shutting down...")
+		s.conn.Close()
+	}()
+
 	buf := make([]byte, mtu)
 	for {
 		n, console, err := s.conn.ReadFromUDP(buf)
