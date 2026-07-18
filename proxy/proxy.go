@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/paddedhelmets/bedrockproxy/raknet"
+	"golang.org/x/net/ipv4"
 )
 
 // mtu is the relay read buffer. RakNet datagrams are typically <= ~1400 bytes
@@ -49,7 +50,8 @@ type Config struct {
 // Server is the LAN-spoof relay.
 type Server struct {
 	cfg      Config
-	conn     *net.UDPConn // LAN-facing
+	conn     *net.UDPConn     // LAN-facing
+	pc       *ipv4.PacketConn // wraps conn; lets us reply from the addressed IP on multi-homed hosts
 	remote   *net.UDPAddr
 	serverID int64
 
@@ -67,6 +69,8 @@ type session struct {
 	console  *net.UDPAddr
 	upstream *net.UDPConn
 	lastSeen time.Time
+	local    net.IP // local address the console targets; downstream replies source from here
+	ifIndex  int
 }
 
 // New resolves addresses and binds the LAN-facing UDP socket.
@@ -125,7 +129,16 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.log.Printf("bedrockproxy up: %s -> %s (serverID=%d, proto=%s motd=%q)",
 		s.cfg.BindAddr, s.cfg.RemoteAddr, s.serverID, s.motd.ProtocolVersion, s.motd.Motd)
 
-	// Closing the socket on shutdown unblocks the ReadFromUDP below so that
+	// Enable IP_PKTINFO so replies (pong + relayed game traffic) are sourced from
+	// the exact local address a console targeted. Required on multi-homed hosts
+	// (e.g. a Pi on wifi + ethernet): without it the kernel's route-chosen source
+	// can differ from the addressed IP and the console drops the mismatched reply.
+	s.pc = ipv4.NewPacketConn(s.conn)
+	if err := s.pc.SetControlMessage(ipv4.FlagDst|ipv4.FlagInterface, true); err != nil {
+		s.log.Printf("warning: IP_PKTINFO unavailable; multi-homed reply-source fix inactive: %v", err)
+	}
+
+	// Closing the socket on shutdown unblocks the read below so that
 	// Ctrl-C / SIGTERM exits the process cleanly instead of hanging.
 	go func() {
 		<-ctx.Done()
@@ -135,19 +148,40 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	buf := make([]byte, mtu)
 	for {
-		n, console, err := s.conn.ReadFromUDP(buf)
+		n, cm, src, err := s.pc.ReadFrom(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			return fmt.Errorf("lan read: %w", err)
 		}
-		s.handle(buf[:n], console)
+		console := src.(*net.UDPAddr)
+		var dst net.IP
+		var ifx int
+		if cm != nil {
+			dst = cm.Dst
+			ifx = cm.IfIndex
+		}
+		s.handle(buf[:n], console, dst, ifx)
 	}
 }
 
+// writeTo sends b to addr, sourced from localIP when IP_PKTINFO is available
+// (so multi-homed hosts reply from the address the client actually targeted).
+func (s *Server) writeTo(b []byte, addr *net.UDPAddr, localIP net.IP, ifIndex int) error {
+	if len(localIP) != 0 {
+		// Force the source IP to the address the client targeted (IP_PKTINFO); let
+		// the kernel route to the client normally (do NOT pin IfIndex — the client
+		// may be reachable via a different interface than the packet arrived on).
+		_, err := s.pc.WriteTo(b, &ipv4.ControlMessage{Src: localIP}, addr)
+		return err
+	}
+	_, err := s.conn.WriteToUDP(b, addr)
+	return err
+}
+
 // handle dispatches one inbound datagram from the LAN.
-func (s *Server) handle(b []byte, console *net.UDPAddr) {
+func (s *Server) handle(b []byte, console *net.UDPAddr, localIP net.IP, ifIndex int) {
 	if raknet.IsUnconnectedPing(b) {
 		s.motdMu.RLock()
 		motd := s.motd
@@ -157,7 +191,7 @@ func (s *Server) handle(b []byte, console *net.UDPAddr) {
 			motdBytes = []byte(motd.String())
 		}
 		pong := raknet.BuildPong(raknet.PingTime(b), s.serverID, motdBytes)
-		if _, err := s.conn.WriteToUDP(pong, console); err != nil {
+		if err := s.writeTo(pong, console, localIP, ifIndex); err != nil {
 			s.log.Printf("pong write to %s: %v", console, err)
 		}
 		return
@@ -168,6 +202,8 @@ func (s *Server) handle(b []byte, console *net.UDPAddr) {
 		s.log.Printf("session %s: %v", console, err)
 		return
 	}
+	sess.local = localIP
+	sess.ifIndex = ifIndex
 	sess.lastSeen = time.Now()
 	if _, err := sess.upstream.Write(b); err != nil {
 		s.log.Printf("upstream write from %s: %v", console, err)
@@ -208,7 +244,7 @@ func (s *Server) relayDownstream(sess *session) {
 			s.closeSession(sess)
 			return
 		}
-		if _, err := s.conn.WriteToUDP(buf[:n], sess.console); err != nil {
+		if err := s.writeTo(buf[:n], sess.console, sess.local, sess.ifIndex); err != nil {
 			s.closeSession(sess)
 			return
 		}

@@ -25,6 +25,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 const (
@@ -51,6 +53,7 @@ var DefaultPinnedDomains = []string{
 // Server is a minimal UDP DNS server.
 type Server struct {
 	conn     *net.UDPConn
+	pc       *ipv4.PacketConn // wraps conn; lets us reply from the addressed IP on multi-homed hosts
 	pinned   map[string]net.IP // lowercased domain -> IPv4
 	upstream *net.UDPAddr
 	log      *log.Logger
@@ -92,8 +95,16 @@ func normalize(d string) string {
 func (s *Server) Serve(ctx context.Context) error {
 	s.log.Printf("dns server up on %s: pinning %d domain(s) -> %s, forwarding rest to %s",
 		s.conn.LocalAddr(), len(s.pinned), s.firstPinnedIP(), s.upstream)
-	// Close the socket on shutdown so the ReadFromUDP below unblocks and the
-	// process exits cleanly on Ctrl-C / SIGTERM.
+	// Enable IP_PKTINFO so replies can be sourced from the exact local address a
+	// client targeted. Required on multi-homed hosts (e.g. a Pi on wifi + ethernet):
+	// without it the kernel's route-chosen source can differ from the addressed IP,
+	// and the client drops the mismatched reply.
+	s.pc = ipv4.NewPacketConn(s.conn)
+	if err := s.pc.SetControlMessage(ipv4.FlagDst|ipv4.FlagInterface, true); err != nil {
+		s.log.Printf("warning: IP_PKTINFO unavailable; multi-homed reply-source fix inactive: %v", err)
+	}
+	// Close the socket on shutdown so the read below unblocks and the process
+	// exits cleanly on Ctrl-C / SIGTERM.
 	go func() {
 		<-ctx.Done()
 		s.log.Printf("dns shutting down...")
@@ -101,19 +112,38 @@ func (s *Server) Serve(ctx context.Context) error {
 	}()
 	buf := make([]byte, bufLen)
 	for {
-		n, client, err := s.conn.ReadFromUDP(buf)
+		n, cm, src, err := s.pc.ReadFrom(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			return fmt.Errorf("dns read: %w", err)
 		}
+		client := src.(*net.UDPAddr)
+		var dst net.IP
+		var ifx int
+		if cm != nil {
+			dst = cm.Dst
+			ifx = cm.IfIndex
+		}
 		// Forwarding may block on the upstream, so handle each query concurrently.
-		go s.handle(append([]byte(nil), buf[:n]...), client)
+		go s.handle(append([]byte(nil), buf[:n]...), client, dst, ifx)
 	}
 }
 
-func (s *Server) handle(query []byte, client *net.UDPAddr) {
+// reply sends b to client, sourced from localIP when IP_PKTINFO is available
+// (so the reply comes from the address the client actually targeted).
+func (s *Server) reply(b []byte, client *net.UDPAddr, localIP net.IP, ifIndex int) {
+	if len(localIP) != 0 {
+		// Force the source IP to the address the client targeted (IP_PKTINFO); let
+		// the kernel route to the client normally.
+		_, _ = s.pc.WriteTo(b, &ipv4.ControlMessage{Src: localIP}, client)
+	} else {
+		_, _ = s.conn.WriteToUDP(b, client)
+	}
+}
+
+func (s *Server) handle(query []byte, client *net.UDPAddr, localIP net.IP, ifIndex int) {
 	if name, ok := parseQName(query); ok {
 		if ip, hit := s.match(name); hit {
 			resp, err := buildAResponse(query, ip)
@@ -121,11 +151,11 @@ func (s *Server) handle(query []byte, client *net.UDPAddr) {
 				s.log.Printf("dns build for %q: %v", name, err)
 				return
 			}
-			_, _ = s.conn.WriteToUDP(resp, client)
+			s.reply(resp, client, localIP, ifIndex)
 			return
 		}
 	}
-	s.forward(query, client)
+	s.forward(query, client, localIP, ifIndex)
 }
 
 // match returns the pinned IP for name (exact match, or any parent suffix).
@@ -144,7 +174,7 @@ func (s *Server) match(name string) (net.IP, bool) {
 	return nil, false
 }
 
-func (s *Server) forward(query []byte, client *net.UDPAddr) {
+func (s *Server) forward(query []byte, client *net.UDPAddr, localIP net.IP, ifIndex int) {
 	up, err := net.DialUDP("udp4", nil, s.upstream)
 	if err != nil {
 		s.log.Printf("dns forward dial: %v", err)
@@ -162,7 +192,7 @@ func (s *Server) forward(query []byte, client *net.UDPAddr) {
 	if err != nil {
 		return
 	}
-	_, _ = s.conn.WriteToUDP(resp[:n], client)
+	s.reply(resp[:n], client, localIP, ifIndex)
 }
 
 // parseQName extracts the queried domain name from the first question of a DNS query.
