@@ -32,6 +32,7 @@ import (
 const (
 	headerLen = 12
 	typeA     = 1
+	typeAAAA  = 28
 	classIN   = 1
 	pinnedTTL = 60
 
@@ -144,18 +145,63 @@ func (s *Server) reply(b []byte, client *net.UDPAddr, localIP net.IP, ifIndex in
 }
 
 func (s *Server) handle(query []byte, client *net.UDPAddr, localIP net.IP, ifIndex int) {
-	if name, ok := parseQName(query); ok {
-		if ip, hit := s.match(name); hit {
-			resp, err := buildAResponse(query, ip)
-			if err != nil {
-				s.log.Printf("dns build for %q: %v", name, err)
-				return
-			}
-			s.reply(resp, client, localIP, ifIndex)
+	name, ok := parseQName(query)
+	if !ok {
+		s.forward(query, client, localIP, ifIndex)
+		return
+	}
+	ip, hit := s.match(name)
+	if !hit {
+		s.forward(query, client, localIP, ifIndex)
+		return
+	}
+	// Pinned domain. Answer A with our IP. For AAAA, return an empty answer so
+	// IPv6-capable resolvers fall back to A — the proxy is IPv4-only, and without
+	// this an AAAA query leaks to a real resolver and the client can reach the
+	// genuine server over IPv6, bypassing the redirect.
+	switch qType(query) {
+	case typeA:
+		resp, err := buildAResponse(query, ip)
+		if err != nil {
+			s.log.Printf("dns build for %q: %v", name, err)
 			return
 		}
+		s.reply(resp, client, localIP, ifIndex)
+	case typeAAAA:
+		if resp, err := buildEmptyResponse(query); err == nil {
+			s.reply(resp, client, localIP, ifIndex)
+		}
+	default:
+		s.forward(query, client, localIP, ifIndex)
 	}
-	s.forward(query, client, localIP, ifIndex)
+}
+
+// qType returns the query's QTYPE (1=A, 28=AAAA, ...), or 0 if unparseable.
+func qType(q []byte) uint16 {
+	end, ok := questionEnd(q)
+	if !ok || end < 4 {
+		return 0
+	}
+	return uint16(q[end-4])<<8 | uint16(q[end-3])
+}
+
+// buildEmptyResponse echoes the query's question with zero answer records
+// (NOERROR, no answers) — used for AAAA on pinned domains so IPv6-capable
+// resolvers fall back to the A record.
+func buildEmptyResponse(query []byte) ([]byte, error) {
+	end, ok := questionEnd(query)
+	if !ok {
+		return nil, errors.New("could not parse question")
+	}
+	opcodeRD := query[2] & 0x79
+	resp := make([]byte, 0, end)
+	resp = append(resp, query[0:2]...)            // id
+	resp = append(resp, 0x80|opcodeRD, 0x80)      // QR=1, copy OPCODE+RD; RA=1, rcode=0
+	resp = append(resp, 0x00, 0x01)               // QDCOUNT=1
+	resp = append(resp, 0x00, 0x00)               // ANCOUNT=0
+	resp = append(resp, 0x00, 0x00, 0x00, 0x00)   // NSCOUNT=0, ARCOUNT=0
+	resp = append(resp, query[headerLen:end]...)  // echo the question
+	return resp, nil
 }
 
 // match returns the pinned IP for name (exact match, or any parent suffix).

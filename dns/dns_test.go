@@ -84,3 +84,44 @@ func TestMatchSuffix(t *testing.T) {
 		}
 	}
 }
+
+// makeAAAAQuery builds a DNS AAAA query for name.
+func makeAAAAQuery(name string) []byte {
+	q := makeQuery(name)
+	q[len(q)-3] = typeAAAA // QTYPE low byte: A(1) -> AAAA(28); high byte already 0
+	return q
+}
+
+func TestQType(t *testing.T) {
+	if got := qType(makeQuery("hivebedrock.network")); got != typeA {
+		t.Fatalf("qType(A) = %d, want %d", got, typeA)
+	}
+	if got := qType(makeAAAAQuery("hivebedrock.network")); got != typeAAAA {
+		t.Fatalf("qType(AAAA) = %d, want %d", got, typeAAAA)
+	}
+}
+
+func TestBuildEmptyResponse(t *testing.T) {
+	resp, err := buildEmptyResponse(makeAAAAQuery("hivebedrock.network"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp[0] != 0x12 || resp[1] != 0x34 {
+		t.Fatal("id not echoed")
+	}
+	if resp[2]&0x80 == 0 {
+		t.Fatal("QR bit not set")
+	}
+	ancount := uint16(resp[6])<<8 | uint16(resp[7])
+	if ancount != 0 {
+		t.Fatalf("ANCOUNT = %d, want 0 (empty AAAA forces IPv4/A fallback)", ancount)
+	}
+	qdcount := uint16(resp[4])<<8 | uint16(resp[5])
+	if qdcount != 1 {
+		t.Fatalf("QDCOUNT = %d, want 1", qdcount)
+	}
+	echoedQType := uint16(resp[len(resp)-4])<<8 | uint16(resp[len(resp)-3])
+	if echoedQType != typeAAAA {
+		t.Fatalf("echoed QTYPE = %d, want AAAA(%d)", echoedQType, typeAAAA)
+	}
+}
