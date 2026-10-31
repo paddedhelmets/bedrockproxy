@@ -65,6 +65,14 @@ func TestBuildAResponseRejectsNonIPv4(t *testing.T) {
 	}
 }
 
+func TestNewRejectsNonIPv4(t *testing.T) {
+	for _, ip := range []net.IP{nil, net.ParseIP("::1")} {
+		if _, err := New("127.0.0.1:0", ip, nil, "", nil); err == nil {
+			t.Errorf("New accepted non-IPv4 target %v", ip)
+		}
+	}
+}
+
 func TestMatchSuffix(t *testing.T) {
 	s := &Server{pinned: map[string]net.IP{"hivebedrock.network": net.IPv4(1, 2, 3, 4)}}
 	cases := []struct {

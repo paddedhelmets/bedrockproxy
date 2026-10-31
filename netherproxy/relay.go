@@ -1,10 +1,20 @@
 // Package netherproxy provides NetherNet HTTP signaling and an encrypted ICE
 // media relay. The relay rewrites only SDP candidate addresses; identity,
 // fingerprints, DTLS, SCTP, and Bedrock payloads remain end-to-end opaque.
+// Signaling must be restricted to a trusted LAN: ICE credentials and SDP
+// candidates do not authorize arbitrary Internet clients to use this relay.
+// Packet limits reduce, but do not prevent, reflection or resource exhaustion.
+// Rate limits cannot guarantee availability under UDP floods or spoofing.
+// A wildcard MediaBind relies on OS UDP source-address selection, which may
+// not match the advertised address on multihomed hosts.
 package netherproxy
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +23,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +30,22 @@ import (
 )
 
 const maxBodySize = 1 << 20
+const maxRelays = 256
+const maxCandidates = 32
+const maxTransactions = 256
+const transactionTTL = 40 * time.Second
+const maxEarlyChecks = 32
+const maxCheckSize = 2048
+const maxCandidateLines = 256
+const stunRate = 200.0
+const stunBurst = 256.0
+const unknownRate = 100.0
+const unknownBurst = 128.0
+const knownRate = 400.0
+const knownBurst = 512.0
+const fanoutRate = 256.0
+const fanoutBurst = 256.0
+const nominationReserve = 32.0
 
 // Config controls a NetherNet signaling and ICE relay.
 type Config struct {
@@ -45,8 +70,9 @@ type Server struct {
 	client                *http.Client
 	log                   *log.Logger
 
-	mu     sync.Mutex
-	relays map[string]*iceRelay
+	mu       sync.Mutex
+	relays   map[*iceRelay]struct{}
+	stopping bool
 }
 
 // New validates configuration and returns a signaling/media relay. A bare
@@ -80,6 +106,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MediaIdleTTL == 0 {
 		cfg.MediaIdleTTL = 5 * time.Minute
 	}
+	if cfg.MediaIdleTTL < 0 {
+		return nil, errors.New("nethernet: MediaIdleTTL must be positive")
+	}
 	if cfg.Client == nil {
 		cfg.Client = &http.Client{Timeout: 20 * time.Second}
 	}
@@ -95,7 +124,7 @@ func New(cfg Config) (*Server, error) {
 		mediaIdleTTL:          cfg.MediaIdleTTL,
 		client:                cfg.Client,
 		log:                   cfg.Logger,
-		relays:                make(map[string]*iceRelay),
+		relays:                make(map[*iceRelay]struct{}),
 	}, nil
 }
 
@@ -117,15 +146,23 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("nethernet: listen %s: %w", s.bindAddr, err)
 	}
-	server := &http.Server{Handler: s, ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: s, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second}
+	done := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		_ = server.Shutdown(context.Background())
-		s.closeRelays()
+		select {
+		case <-ctx.Done():
+			s.closeRelays()
+			_ = server.Close()
+		case <-done:
+		}
 	}()
-	go s.reapRelays(ctx)
+	reapCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go s.reapRelays(reapCtx)
 	s.log.Printf("nethernet signaling/media relay up: %s -> %s", s.bindAddr, s.remote)
 	err = server.Serve(listener)
+	close(done)
+	s.closeRelays()
 	if errors.Is(err, http.ErrServerClosed) || ctx.Err() != nil {
 		return nil
 	}
@@ -135,6 +172,9 @@ func (s *Server) Serve(ctx context.Context) error {
 // ServeHTTP forwards the two standard NetherNet signaling endpoints and
 // rewrites candidate addresses to the relay's client/upstream interfaces.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
 	if !validPath(r.Method, r.URL.Path) {
 		http.NotFound(w, r)
 		return
@@ -163,22 +203,29 @@ func (s *Server) handleOffer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "SDP offer too large or unreadable", http.StatusRequestEntityTooLarge)
 		return
 	}
+	clientUfrag, clientPwd, err := iceCredentials(string(body))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	if s.stopping || len(s.relays) >= maxRelays {
+		s.mu.Unlock()
+		http.Error(w, "media relay capacity exceeded", http.StatusServiceUnavailable)
+		return
+	}
 	relay, err := newIceRelay(s.mediaBind)
 	if err != nil {
+		s.mu.Unlock()
 		http.Error(w, "media relay unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	key := r.URL.Path
-	s.mu.Lock()
-	if old := s.relays[key]; old != nil {
-		old.close()
-	}
-	s.relays[key] = relay
+	s.relays[relay] = struct{}{}
 	s.mu.Unlock()
 	keep := false
 	defer func() {
 		if !keep {
-			s.removeRelay(key, relay)
+			s.removeRelay(relay)
 		}
 	}()
 
@@ -187,7 +234,7 @@ func (s *Server) handleOffer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	_ = clientCandidates // The relay learns the client address from the first packet.
+	relay.configureOffer(clientCandidates, clientUfrag, clientPwd)
 	resp, err := s.upstreamRequest(r, strings.NewReader(offer))
 	if err != nil {
 		s.log.Printf("nethernet offer upstream: %v", err)
@@ -213,7 +260,12 @@ func (s *Server) handleOffer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	relay.setUpstream(upstreamCandidates)
+	upstreamUfrag, upstreamPwd, err := iceCredentials(string(answerBytes))
+	if err != nil || upstreamUfrag == clientUfrag {
+		http.Error(w, "invalid upstream ICE credentials", http.StatusBadGateway)
+		return
+	}
+	relay.configureAnswer(upstreamCandidates, upstreamUfrag, upstreamPwd)
 	keep = true
 	w.Header().Set("Content-Type", "application/sdp")
 	w.WriteHeader(http.StatusOK)
@@ -253,20 +305,19 @@ func copyResponseBody(w http.ResponseWriter, status int, contentType string, bod
 	_, _ = w.Write(body)
 }
 
-func (s *Server) removeRelay(key string, relay *iceRelay) {
+func (s *Server) removeRelay(relay *iceRelay) {
 	s.mu.Lock()
-	if s.relays[key] == relay {
-		delete(s.relays, key)
-	}
+	delete(s.relays, relay)
 	s.mu.Unlock()
 	relay.close()
 }
 
 func (s *Server) closeRelays() {
 	s.mu.Lock()
+	s.stopping = true
 	all := make([]*iceRelay, 0, len(s.relays))
-	for key, relay := range s.relays {
-		delete(s.relays, key)
+	for relay := range s.relays {
+		delete(s.relays, relay)
 		all = append(all, relay)
 	}
 	s.mu.Unlock()
@@ -285,9 +336,9 @@ func (s *Server) reapRelays(ctx context.Context) {
 		case now := <-t.C:
 			s.mu.Lock()
 			var dead []*iceRelay
-			for key, relay := range s.relays {
+			for relay := range s.relays {
 				if now.Sub(relay.lastSeen()) > s.mediaIdleTTL {
-					delete(s.relays, key)
+					delete(s.relays, relay)
 					dead = append(dead, relay)
 				}
 			}
@@ -300,13 +351,39 @@ func (s *Server) reapRelays(ctx context.Context) {
 }
 
 type iceRelay struct {
-	conn     *net.UDPConn
-	mu       sync.Mutex
-	client   *net.UDPAddr
-	upstream map[string]*net.UDPAddr
-	last     time.Time
-	closed   chan struct{}
-	once     sync.Once
+	conn                                               *net.UDPConn
+	mu                                                 sync.Mutex
+	client                                             *net.UDPAddr
+	upstream                                           *net.UDPAddr
+	clientCandidates, upstreamCandidates               []net.UDPAddr
+	clientUfrag, clientPwd, upstreamUfrag, upstreamPwd string
+	nominated                                          bool
+	nominationSerial, selectedNomination               uint64
+	transactions                                       []iceTransaction
+	early                                              []earlyCheck
+	stunTokens, fanoutTokens                           float64
+	stunRefill, fanoutRefill                           time.Time
+	responseTokens                                     float64
+	responseRefill                                     time.Time
+	knownTokens, unknownTokens                         float64
+	knownRefill, unknownRefill                         time.Time
+	last                                               time.Time
+	closed                                             chan struct{}
+	once                                               sync.Once
+}
+
+type iceTransaction struct {
+	id                    [12]byte
+	source, destination   *net.UDPAddr
+	fromClient, nominated bool
+	created               time.Time
+	digest                [32]byte
+	serial                uint64
+}
+
+type earlyCheck struct {
+	packet []byte
+	source *net.UDPAddr
 }
 
 func newIceRelay(bind string) (*iceRelay, error) {
@@ -318,20 +395,41 @@ func newIceRelay(bind string) (*iceRelay, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &iceRelay{conn: conn, upstream: make(map[string]*net.UDPAddr), last: time.Now(), closed: make(chan struct{})}
+	now := time.Now()
+	r := &iceRelay{conn: conn, last: now, closed: make(chan struct{}), stunTokens: stunBurst, responseTokens: stunBurst, fanoutTokens: fanoutBurst, stunRefill: now, responseRefill: now, fanoutRefill: now, knownTokens: knownBurst, unknownTokens: unknownBurst, knownRefill: now, unknownRefill: now}
 	go r.loop()
 	return r, nil
 }
 
 func (r *iceRelay) port() int { return r.conn.LocalAddr().(*net.UDPAddr).Port }
 
-func (r *iceRelay) setUpstream(addrs []net.UDPAddr) {
+func (r *iceRelay) configureOffer(client []net.UDPAddr, cu, cp string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, addr := range addrs {
-		copyAddr := addr
-		r.upstream[addr.String()] = &copyAddr
+	r.clientCandidates = nil
+	for i := range client {
+		addCandidate(&r.clientCandidates, &client[i])
 	}
+	r.clientUfrag, r.clientPwd = cu, cp
+}
+
+func (r *iceRelay) configureAnswer(upstream []net.UDPAddr, uu, up string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.upstreamCandidates = nil
+	for i := range upstream {
+		addCandidate(&r.upstreamCandidates, &upstream[i])
+	}
+	r.upstreamUfrag, r.upstreamPwd = uu, up
+	for _, check := range r.early {
+		r.handlePacket(check.packet, check.source)
+	}
+	r.early = nil
+}
+
+func (r *iceRelay) configure(client, upstream []net.UDPAddr, cu, cp, uu, up string) {
+	r.configureOffer(client, cu, cp)
+	r.configureAnswer(upstream, uu, up)
 }
 
 func (r *iceRelay) lastSeen() time.Time {
@@ -352,23 +450,249 @@ func (r *iceRelay) loop() {
 				return
 			}
 		}
-		packet := slices.Clone(buf[:n])
 		r.mu.Lock()
-		r.last = time.Now()
-		_, fromUpstream := r.upstream[src.String()]
-		client := cloneUDP(r.client)
-		if fromUpstream {
-			if client != nil {
-				_, _ = r.conn.WriteToUDP(packet, client)
-			}
-		} else {
-			r.client = cloneUDP(src)
-			for _, upstream := range r.upstream {
-				_, _ = r.conn.WriteToUDP(packet, upstream)
-			}
-		}
+		r.handlePacket(buf[:n], src)
 		r.mu.Unlock()
 	}
+}
+
+// handlePacket is called with r.mu held. A data path requires a matching
+// authenticated response, but that is not proof against a credential holder
+// able to spoof the destination address.
+func (r *iceRelay) handlePacket(packet []byte, src *net.UDPAddr) {
+	now := time.Now()
+	if len(packet) >= 20 && binary.BigEndian.Uint32(packet[4:8]) == 0x2112a442 {
+		typ := binary.BigEndian.Uint16(packet[:2])
+		if typ == 1 {
+			if len(packet) > maxCheckSize {
+				return
+			}
+			known := containsCandidate(r.clientCandidates, src) || containsCandidate(r.upstreamCandidates, src)
+			if known {
+				if !takeTokens(&r.knownTokens, &r.knownRefill, now, knownRate, knownBurst, 1, 0) {
+					return
+				}
+			} else if !takeTokens(&r.unknownTokens, &r.unknownRefill, now, unknownRate, unknownBurst, 1, 0) {
+				return
+			}
+			if r.upstreamPwd == "" {
+				// The answer's ufrag is not yet known. Authenticate the password
+				// now, then check the complete username before forwarding.
+				if len(r.early) < maxEarlyChecks && validICECheck(packet, "", r.clientPwd) && takeTokens(&r.stunTokens, &r.stunRefill, now, stunRate, stunBurst, 1, 0) {
+					r.early = append(r.early, earlyCheck{append([]byte(nil), packet...), cloneUDP(src)})
+				}
+				return
+			}
+			fromClient := validICECheck(packet, r.upstreamUfrag+":"+r.clientUfrag, r.upstreamPwd)
+			fromUpstream := validICECheck(packet, r.clientUfrag+":"+r.upstreamUfrag, r.clientPwd)
+			if fromClient == fromUpstream {
+				return
+			}
+			if !takeTokens(&r.stunTokens, &r.stunRefill, now, stunRate, stunBurst, 1, 0) {
+				return
+			}
+			var own *[]net.UDPAddr
+			var destinations []net.UDPAddr
+			if fromClient {
+				own, destinations = &r.clientCandidates, r.upstreamCandidates
+			} else {
+				own, destinations = &r.upstreamCandidates, r.clientCandidates
+			}
+			addCandidate(own, src)
+			r.pruneTransactions(now)
+			var id [12]byte
+			copy(id[:], packet[8:20])
+			nominated := hasNomination(packet)
+			digest := sha256.Sum256(packet)
+			var serial uint64
+			existing := false
+			for _, tx := range r.transactions {
+				if tx.id == id && tx.fromClient == fromClient && tx.source.String() == src.String() {
+					existing = true
+					if tx.digest != digest {
+						return
+					}
+					serial = tx.serial
+				}
+			}
+			if nominated && serial == 0 {
+				r.nominationSerial++
+				serial = r.nominationSerial
+			}
+			for i := range destinations {
+				dst := &destinations[i]
+				if dst.String() == src.String() {
+					continue
+				}
+				found := false
+				for _, tx := range r.transactions {
+					if tx.id == id && tx.fromClient == fromClient && tx.source.String() == src.String() && tx.destination.String() == dst.String() {
+						found = true
+						break
+					}
+				}
+				if !found {
+					limit := maxTransactions - maxCandidates
+					if nominated {
+						limit = maxTransactions
+					}
+					if len(r.transactions) >= limit && nominated && existing {
+						continue
+					}
+				}
+				reserve := nominationReserve
+				if nominated {
+					reserve = 0
+				}
+				if !takeTokens(&r.fanoutTokens, &r.fanoutRefill, now, fanoutRate, fanoutBurst, 1, reserve) {
+					continue
+				}
+				if !found {
+					limit := maxTransactions - maxCandidates
+					if nominated {
+						limit = maxTransactions
+					}
+					if len(r.transactions) >= limit && !r.evictTransaction(id, src, fromClient, nominated) {
+						continue
+					}
+					r.transactions = append(r.transactions, iceTransaction{id, cloneUDP(src), cloneUDP(dst), fromClient, nominated, now, digest, serial})
+				}
+				_, _ = r.conn.WriteToUDP(packet, dst)
+			}
+			r.last = now
+			return
+		}
+		if typ == 0x0101 || typ == 0x0111 {
+			r.pruneTransactions(now)
+			for i, tx := range r.transactions {
+				if len(packet) < 20 || string(tx.id[:]) != string(packet[8:20]) || tx.destination.String() != src.String() {
+					continue
+				}
+				password := r.clientPwd
+				if tx.fromClient {
+					password = r.upstreamPwd
+				}
+				if !validSTUNIntegrity(packet, typ, "", password, false) {
+					continue
+				}
+				if typ == 0x0101 && !hasMappedAddress(packet) {
+					continue
+				}
+				if !takeTokens(&r.responseTokens, &r.responseRefill, now, stunRate, stunBurst, 1, 0) {
+					return
+				}
+				if typ == 0x0101 && (!r.nominated || (tx.nominated && tx.serial > r.selectedNomination)) {
+					if tx.fromClient {
+						r.client, r.upstream = cloneUDP(tx.source), cloneUDP(src)
+					} else {
+						r.client, r.upstream = cloneUDP(src), cloneUDP(tx.source)
+					}
+					if tx.nominated {
+						r.nominated = true
+						r.selectedNomination = tx.serial
+					}
+				}
+				_, _ = r.conn.WriteToUDP(packet, tx.source)
+				copy(r.transactions[i:], r.transactions[i+1:])
+				r.transactions = r.transactions[:len(r.transactions)-1]
+				r.last = now
+				return
+			}
+			return
+		}
+	}
+	if r.client != nil && r.upstream != nil {
+		if src.String() == r.client.String() {
+			_, _ = r.conn.WriteToUDP(packet, r.upstream)
+			r.last = now
+		} else if src.String() == r.upstream.String() {
+			_, _ = r.conn.WriteToUDP(packet, r.client)
+			r.last = now
+		}
+	}
+}
+
+// Prefer evicting ordinary work. Preserve at least one full nomination's
+// worth of entries when ordinary checks must displace nomination traffic.
+func (r *iceRelay) evictTransaction(id [12]byte, src *net.UDPAddr, fromClient, allowNomination bool) bool {
+	oldest := -1
+	nominationCount := 0
+	for i, tx := range r.transactions {
+		if tx.nominated {
+			nominationCount++
+		}
+		if tx.nominated && !allowNomination {
+			continue
+		}
+		if tx.id == id && tx.fromClient == fromClient && tx.source.String() == src.String() {
+			continue
+		}
+		if oldest < 0 || (r.transactions[oldest].nominated && !tx.nominated) ||
+			(r.transactions[oldest].nominated == tx.nominated && tx.created.Before(r.transactions[oldest].created)) {
+			oldest = i
+		}
+	}
+	if oldest < 0 && !allowNomination && nominationCount > maxCandidates {
+		for i, tx := range r.transactions {
+			if !tx.nominated || (tx.id == id && tx.fromClient == fromClient && tx.source.String() == src.String()) {
+				continue
+			}
+			if oldest < 0 || tx.created.Before(r.transactions[oldest].created) {
+				oldest = i
+			}
+		}
+	}
+	if oldest < 0 {
+		return false
+	}
+	copy(r.transactions[oldest:], r.transactions[oldest+1:])
+	r.transactions = r.transactions[:len(r.transactions)-1]
+	return true
+}
+
+func containsCandidate(candidates []net.UDPAddr, addr *net.UDPAddr) bool {
+	for _, candidate := range candidates {
+		if candidate.String() == addr.String() {
+			return true
+		}
+	}
+	return false
+}
+
+func takeTokens(tokens *float64, last *time.Time, now time.Time, rate, burst, cost, reserve float64) bool {
+	if now.After(*last) {
+		*tokens += now.Sub(*last).Seconds() * rate
+		if *tokens > burst {
+			*tokens = burst
+		}
+		*last = now
+	}
+	if *tokens < cost+reserve {
+		return false
+	}
+	*tokens -= cost
+	return true
+}
+
+func addCandidate(candidates *[]net.UDPAddr, addr *net.UDPAddr) {
+	for _, candidate := range *candidates {
+		if candidate.String() == addr.String() {
+			return
+		}
+	}
+	if len(*candidates) < maxCandidates {
+		*candidates = append(*candidates, *cloneUDP(addr))
+	}
+}
+
+func (r *iceRelay) pruneTransactions(now time.Time) {
+	kept := r.transactions[:0]
+	for _, tx := range r.transactions {
+		if now.Sub(tx.created) < transactionTTL {
+			kept = append(kept, tx)
+		}
+	}
+	r.transactions = kept
 }
 
 func (r *iceRelay) close() {
@@ -387,17 +711,133 @@ func cloneUDP(addr *net.UDPAddr) *net.UDPAddr {
 	return &copyAddr
 }
 
+// This relay supports a single ICE credential pair per SDP, not unbundled
+// media sections with distinct ICE transports.
+func iceCredentials(sdp string) (string, string, error) {
+	var ufrag, pwd string
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		var dst *string
+		var value string
+		switch {
+		case strings.HasPrefix(line, "a=ice-ufrag:"):
+			dst, value = &ufrag, strings.TrimPrefix(line, "a=ice-ufrag:")
+		case strings.HasPrefix(line, "a=ice-pwd:"):
+			dst, value = &pwd, strings.TrimPrefix(line, "a=ice-pwd:")
+		default:
+			continue
+		}
+		if value == "" || strings.ContainsAny(value, " \t:\r\n") || (*dst != "" && *dst != value) {
+			return "", "", errors.New("invalid or multiple ICE credentials")
+		}
+		*dst = value
+	}
+	if ufrag == "" || pwd == "" {
+		return "", "", errors.New("missing ICE credentials")
+	}
+	return ufrag, pwd, nil
+}
+
+// RFC 8445 ICE checks use the receiver's password and USERNAME in
+// receiver:sender order. RFC 8489 computes HMAC through the attribute
+// preceding MESSAGE-INTEGRITY, with the header length adjusted to include it.
+func validICECheck(packet []byte, username, password string) bool {
+	return validSTUNIntegrity(packet, 1, username, password, true)
+}
+
+func validSTUNIntegrity(packet []byte, messageType uint16, username, password string, requireUser bool) bool {
+	if password == "" || len(packet) < 20 || binary.BigEndian.Uint16(packet[:2]) != messageType ||
+		binary.BigEndian.Uint32(packet[4:8]) != 0x2112a442 ||
+		int(binary.BigEndian.Uint16(packet[2:4])) != len(packet)-20 || len(packet)%4 != 0 {
+		return false
+	}
+	seenUser, seenIntegrity := false, false
+	valid := false
+	for pos := 20; pos < len(packet); {
+		if pos+4 > len(packet) {
+			return false
+		}
+		typ, size := binary.BigEndian.Uint16(packet[pos:]), int(binary.BigEndian.Uint16(packet[pos+2:]))
+		end := pos + 4 + size
+		next := pos + 4 + (size+3)&^3
+		if end > len(packet) || next > len(packet) {
+			return false
+		}
+		switch typ {
+		case 0x0006:
+			if seenUser || seenIntegrity || size == 0 || (username != "" && string(packet[pos+4:end]) != username) {
+				return false
+			}
+			seenUser = true
+		case 0x0008:
+			if seenIntegrity || (requireUser && !seenUser) || size != sha1.Size {
+				return false
+			}
+			seenIntegrity = true
+			header := append([]byte(nil), packet[:20]...)
+			binary.BigEndian.PutUint16(header[2:4], uint16(end-20))
+			mac := hmac.New(sha1.New, []byte(password))
+			_, _ = mac.Write(header)
+			_, _ = mac.Write(packet[20:pos])
+			valid = hmac.Equal(mac.Sum(nil), packet[pos+4:end])
+		}
+		pos = next
+	}
+	return seenIntegrity && valid
+}
+
+func hasNomination(packet []byte) bool {
+	use, controlling := false, false
+	for pos := 20; pos+4 <= len(packet); {
+		typ, size := binary.BigEndian.Uint16(packet[pos:]), int(binary.BigEndian.Uint16(packet[pos+2:]))
+		next := pos + 4 + (size+3)&^3
+		if next > len(packet) || typ == 8 {
+			break
+		}
+		if typ == 0x0025 && size == 0 {
+			use = true
+		}
+		if typ == 0x802a && size == 8 {
+			controlling = true
+		}
+		pos = next
+	}
+	return use && controlling
+}
+
+func hasMappedAddress(packet []byte) bool {
+	for pos := 20; pos+4 <= len(packet); {
+		typ, size := binary.BigEndian.Uint16(packet[pos:]), int(binary.BigEndian.Uint16(packet[pos+2:]))
+		next := pos + 4 + (size+3)&^3
+		if next > len(packet) || typ == 8 {
+			break
+		}
+		if typ == 0x0020 && ((size == 8 && packet[pos+5] == 1) || (size == 20 && packet[pos+5] == 2)) {
+			return true
+		}
+		pos = next
+	}
+	return false
+}
+
 func rewriteCandidates(sdp, address string, port int) (string, []net.UDPAddr, error) {
 	lines := strings.SplitAfter(sdp, "\n")
 	var candidates []net.UDPAddr
 	count := 0
+	seen := make(map[string]struct{})
+	candidateLines := 0
 	for i, raw := range lines {
 		line := strings.TrimSuffix(strings.TrimSuffix(raw, "\n"), "\r")
 		if !strings.HasPrefix(line, "a=candidate:") {
 			continue
 		}
+		candidateLines++
+		if candidateLines > maxCandidateLines {
+			return "", nil, errors.New("too many ICE candidate lines")
+		}
 		fields := strings.Fields(line)
 		if len(fields) < 6 {
+			lines[i] = ""
 			continue
 		}
 		ip := net.ParseIP(fields[4])
@@ -409,7 +849,14 @@ func rewriteCandidates(sdp, address string, port int) (string, []net.UDPAddr, er
 			lines[i] = ""
 			continue
 		}
-		candidates = append(candidates, net.UDPAddr{IP: ip.To4(), Port: candidatePort})
+		candidate := net.UDPAddr{IP: ip.To4(), Port: candidatePort}
+		if _, ok := seen[candidate.String()]; !ok {
+			seen[candidate.String()] = struct{}{}
+			candidates = append(candidates, candidate)
+			if len(candidates) > maxCandidates {
+				return "", nil, errors.New("too many ICE candidates")
+			}
+		}
 		fields[4] = address
 		fields[5] = strconv.Itoa(port)
 		for j, field := range fields {

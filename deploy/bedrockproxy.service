@@ -11,7 +11,9 @@ Type=simple
 User=bedrockproxy
 Group=bedrockproxy
 
-# Edit deploy/bedrockproxy.env (REMOTE is required).
+# Defaults preserve older environment files without the NetherNet variables.
+Environment="PROTOCOL=raknet" "REMOTE_SIGNAL_URL=" "MEDIA_BIND=:0" "MEDIA_CLIENT_ADDRESS=" "MEDIA_UPSTREAM_ADDRESS="
+# Edit /etc/bedrockproxy/bedrockproxy.env.
 EnvironmentFile=/etc/bedrockproxy/bedrockproxy.env
 ExecStart=/usr/local/bin/bedrockproxy \
     --protocol "${PROTOCOL}" \
@@ -30,7 +32,7 @@ ExecStart=/usr/local/bin/bedrockproxy \
 Restart=on-failure
 RestartSec=5s
 
-# Hardening: the proxy needs UDP 19132 on the LAN and outbound UDP only.
+# Hardening: networking requirements depend on the selected transport.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
