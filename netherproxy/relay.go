@@ -63,6 +63,7 @@ type Config struct {
 type Server struct {
 	bindAddr              string
 	remote                *url.URL
+	remoteIP              net.IP
 	mediaBind             string
 	clientAdvertiseAddr   net.IP
 	upstreamAdvertiseAddr net.IP
@@ -115,9 +116,15 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
+	host := remote.Hostname()
+	remoteAddr, err := net.ResolveIPAddr("ip4", host)
+	if err != nil || remoteAddr.IP == nil || remoteAddr.IP.To4() == nil {
+		return nil, fmt.Errorf("nethernet: cannot resolve remote %q to an IPv4 address: %v", host, err)
+	}
 	return &Server{
 		bindAddr:              cfg.BindAddr,
 		remote:                remote,
+		remoteIP:              remoteAddr.IP.To4(),
 		mediaBind:             cfg.MediaBind,
 		clientAdvertiseAddr:   clientAddr,
 		upstreamAdvertiseAddr: upstreamAddr,
@@ -126,6 +133,30 @@ func New(cfg Config) (*Server, error) {
 		log:                   cfg.Logger,
 		relays:                make(map[*iceRelay]struct{}),
 	}, nil
+}
+
+// remapUpstreamCandidates retargets upstream media at the signaling peer's IP.
+// A Docker-bridged BDS advertises its container IP, which is unroutable from
+// here, but works through matching published ports on the host we reached for
+// signaling. Bare-metal upstreams advertise the same IP and are unaffected.
+func (s *Server) remapUpstreamCandidates(cands []net.UDPAddr) []net.UDPAddr {
+	if len(cands) == 0 {
+		return cands
+	}
+	out := make([]net.UDPAddr, 0, len(cands))
+	remapped := make([]string, 0, len(cands))
+	for _, c := range cands {
+		if !c.IP.Equal(s.remoteIP) {
+			remapped = append(remapped, c.String())
+			c.IP = s.remoteIP
+		}
+		out = append(out, c)
+	}
+	if len(remapped) > 0 {
+		s.log.Printf("nethernet: upstream advertised %s; relaying media to %s instead (published port)",
+			strings.Join(remapped, ", "), net.JoinHostPort(s.remoteIP.String(), strconv.Itoa(out[0].Port)))
+	}
+	return out
 }
 
 func parseIPv4(value, name string) (net.IP, error) {
@@ -265,7 +296,7 @@ func (s *Server) handleOffer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid upstream ICE credentials", http.StatusBadGateway)
 		return
 	}
-	relay.configureAnswer(upstreamCandidates, upstreamUfrag, upstreamPwd)
+	relay.configureAnswer(s.remapUpstreamCandidates(upstreamCandidates), upstreamUfrag, upstreamPwd)
 	keep = true
 	w.Header().Set("Content-Type", "application/sdp")
 	w.WriteHeader(http.StatusOK)
