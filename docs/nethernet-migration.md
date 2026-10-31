@@ -110,16 +110,19 @@ to the upstream identity wall:
   policy decision; no server.properties knob relaxes it, and the bridge cannot
   mint the player's assertion (it never holds player keys).
 
-Consequence: LAN-discovery bridging to a Mojang BDS upstream is architecturally
-blocked until Mojang offers a permissive policy or an undocumented knob is
-found. Clients that do their own HTTP signaling (manual server entry on Win/
-mobile — validated working through the relay, including two simultaneous
-sessions) mint assertions naturally, which makes the Switch featured-server DNS
-redirect path (`--dns-listen`, now transport-independent) the most promising
-remaining console route: it steers the client onto the HTTP path where
-assertions exist. Open Switch questions: HTTPS-to-featured-servers behavior
-(certificate wall for DNS-only redirection) and TOFU prompt behavior on
-plaintext HTTP.
+Consequence: LAN-discovery bridging via HTTP translation is blocked for Mojang
+BDS upstreams. However, a LAN→LAN signaling tunnel (`--lan-upstream`) bypasses
+the wall entirely: the proxy republishes the upstream's own LAN advertisement
+and relays signaling verbatim, so the upstream experiences a vanilla LAN join
+with no HTTP signaling and no SDP identity assertions. Validated on hardware
+(2026-10-31): a LAN client discovered, joined, and played on the remote BDS
+through the tunnel, with media flowing directly between the client and the
+upstream's public ICE candidates. Tailnet-topology upstreams whose candidates
+are not client-reachable still need answer-candidate rewriting plus a media
+relay on the proxy. Clients that do their own HTTP signaling (manual server
+entry on Win/mobile) also work through the relay. The Switch featured-server
+DNS redirect path (`--dns-listen`, transport-independent) remains untested on
+hardware.
 
 Candidate implementation references include `df-mc/go-nethernet` (Go, MIT) and
 `PrismarineJS/node-nethernet` (Node, MIT). Both are active but NetherNet support
