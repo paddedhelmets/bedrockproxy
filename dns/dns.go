@@ -45,7 +45,7 @@ var DefaultPinnedDomains = []string{
 // Server is a minimal UDP DNS server.
 type Server struct {
 	conn     *net.UDPConn
-	pc       *ipv4.PacketConn // wraps conn; lets us reply from the addressed IP on multi-homed hosts
+	pc       *ipv4.PacketConn  // wraps conn; lets us reply from the addressed IP on multi-homed hosts
 	pinned   map[string]net.IP // lowercased domain -> IPv4
 	upstream *net.UDPAddr
 	log      *log.Logger
@@ -189,12 +189,12 @@ func buildEmptyResponse(query []byte) ([]byte, error) {
 	}
 	opcodeRD := query[2] & 0x79
 	resp := make([]byte, 0, end)
-	resp = append(resp, query[0:2]...)            // id
-	resp = append(resp, 0x80|opcodeRD, 0x80)      // QR=1, copy OPCODE+RD; RA=1, rcode=0
-	resp = append(resp, 0x00, 0x01)               // QDCOUNT=1
-	resp = append(resp, 0x00, 0x00)               // ANCOUNT=0
-	resp = append(resp, 0x00, 0x00, 0x00, 0x00)   // NSCOUNT=0, ARCOUNT=0
-	resp = append(resp, query[headerLen:end]...)  // echo the question
+	resp = append(resp, query[0:2]...)           // id
+	resp = append(resp, 0x80|opcodeRD, 0x80)     // QR=1, copy OPCODE+RD; RA=1, rcode=0
+	resp = append(resp, 0x00, 0x01)              // QDCOUNT=1
+	resp = append(resp, 0x00, 0x00)              // ANCOUNT=0
+	resp = append(resp, 0x00, 0x00, 0x00, 0x00)  // NSCOUNT=0, ARCOUNT=0
+	resp = append(resp, query[headerLen:end]...) // echo the question
 	return resp, nil
 }
 
@@ -281,10 +281,10 @@ func buildAResponse(query []byte, ip net.IP) ([]byte, error) {
 	resp := make([]byte, 0, end+16)
 	resp = append(resp, id...)
 	resp = append(resp, 0x80|opcodeRD, 0x80)
-	resp = append(resp, 0x00, 0x01)                // QDCOUNT=1
-	resp = append(resp, 0x00, 0x01)                // ANCOUNT=1
-	resp = append(resp, 0x00, 0x00, 0x00, 0x00)    // NSCOUNT=0, ARCOUNT=0
-	resp = append(resp, query[headerLen:end]...)   // echo the question
+	resp = append(resp, 0x00, 0x01)              // QDCOUNT=1
+	resp = append(resp, 0x00, 0x01)              // ANCOUNT=1
+	resp = append(resp, 0x00, 0x00, 0x00, 0x00)  // NSCOUNT=0, ARCOUNT=0
+	resp = append(resp, query[headerLen:end]...) // echo the question
 	// Answer: name pointer to offset 12, type A, class IN, TTL, RDLEN=4, address.
 	resp = append(resp, 0xc0, 0x0c)
 	resp = append(resp, 0x00, typeA)
