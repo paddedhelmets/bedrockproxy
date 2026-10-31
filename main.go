@@ -44,6 +44,7 @@ func main() {
 		mediaClientIP   string
 		mediaUpstreamIP string
 		lanDiscover     string
+		lanUpstream     string
 		lanNetworkID    uint64
 		lanProtocol     int
 		lanVersion      string
@@ -61,6 +62,7 @@ func main() {
 	flag.StringVar(&mediaClientIP, "media-client-address", "", "IPv4 address advertised to Bedrock clients for NetherNet UDP")
 	flag.StringVar(&mediaUpstreamIP, "media-upstream-address", "", "IPv4 address advertised to the upstream NetherNet server for UDP")
 	flag.StringVar(&lanDiscover, "lan-discover", "", "experimental: enable NetherNet LAN discovery/signaling bridge (UDP bind, e.g. :7551); empty = off")
+	flag.StringVar(&lanUpstream, "lan-upstream", "", "experimental: tunnel LAN signaling to an upstream NetherNet LAN host (host[:port], default 7551) instead of HTTP translation; requires --lan-discover")
 	flag.Uint64Var(&lanNetworkID, "lan-network-id", 0, "experimental: LAN discovery network ID; 0 = random")
 	flag.IntVar(&lanProtocol, "lan-protocol", 0, "experimental: advertised Bedrock protocol; 0 = mirror the upstream signaling status")
 	flag.StringVar(&lanVersion, "lan-version", "", "experimental: advertised Bedrock version; empty = mirror the upstream signaling status")
@@ -91,6 +93,9 @@ func main() {
 	}
 	if lanDiscover != "" && transport != protocolNetherNet {
 		log.Fatal("--lan-discover is only supported with --protocol nethernet")
+	}
+	if lanUpstream != "" && lanDiscover == "" {
+		log.Fatal("--lan-upstream requires --lan-discover")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -145,7 +150,23 @@ func main() {
 		}
 		run("nethernet signaling", func() error { return srv.Serve(ctx) })
 
-		if lanDiscover != "" {
+		if lanDiscover != "" && lanUpstream != "" {
+			tunnel, err := netherproxy.NewLANTunnel(netherproxy.TunnelConfig{
+				BindAddr:     lanDiscover,
+				UpstreamAddr: lanUpstream,
+				Logger:       log.Default(),
+			})
+			if err != nil {
+				log.Fatalf("lan-upstream init: %v", err)
+			}
+			go func() {
+				<-ctx.Done()
+				if err := tunnel.Close(); err != nil {
+					log.Printf("lan tunnel close: %v", err)
+				}
+			}()
+			log.Printf("lan tunnel active (network ID %s, experimental, trusted LAN only)", tunnel.NetworkID())
+		} else if lanDiscover != "" {
 			data, err := lanServerData(remote, lanAuth, lanProtocol, lanVersion)
 			if err != nil {
 				log.Fatalf("lan-discover init: %v", err)
