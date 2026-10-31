@@ -110,6 +110,8 @@ Flags:
 | `--media-upstream-address` | *(required)* | IPv4 address visible to the upstream BDS. |
 | `--lan-discover` | *(off)* | Experimental: UDP bind for the NetherNet LAN discovery/signaling bridge (e.g. `:7551`). Trusted LAN only; unvalidated on console hardware. |
 | `--lan-network-id` | *(random)* | Experimental: LAN discovery network ID. |
+| `--lan-upstream` | *(off)* | Experimental: tunnel LAN signaling to an upstream NetherNet LAN host (`host[:port]`, default 7551) instead of HTTP translation. |
+| `--lan-media` | `direct` | Experimental: `direct` passes upstream candidates through; `assist` relays media through the proxy when upstream candidates are unroutable (e.g. Docker-bridged BDS with published ports). |
 | `--lan-protocol` | *(mirror)* | Experimental: advertised protocol override. |
 | `--lan-version` | *(mirror)* | Experimental: advertised version override. |
 | `--lan-auth` | `online` | Experimental: advertised auth policy: `online`, `self-signed`, or `both`. |
