@@ -45,6 +45,7 @@ func main() {
 		mediaUpstreamIP string
 		lanDiscover     string
 		lanUpstream     string
+		lanMedia        string
 		lanNetworkID    uint64
 		lanProtocol     int
 		lanVersion      string
@@ -63,6 +64,7 @@ func main() {
 	flag.StringVar(&mediaUpstreamIP, "media-upstream-address", "", "IPv4 address advertised to the upstream NetherNet server for UDP")
 	flag.StringVar(&lanDiscover, "lan-discover", "", "experimental: enable NetherNet LAN discovery/signaling bridge (UDP bind, e.g. :7551); empty = off")
 	flag.StringVar(&lanUpstream, "lan-upstream", "", "experimental: tunnel LAN signaling to an upstream NetherNet LAN host (host[:port], default 7551) instead of HTTP translation; requires --lan-discover")
+	flag.StringVar(&lanMedia, "lan-media", "direct", "experimental: LAN tunnel media mode: direct (clients reach upstream candidates) or assist (proxy relays media for unroutable candidates, e.g. Docker-bridged upstream)")
 	flag.Uint64Var(&lanNetworkID, "lan-network-id", 0, "experimental: LAN discovery network ID; 0 = random")
 	flag.IntVar(&lanProtocol, "lan-protocol", 0, "experimental: advertised Bedrock protocol; 0 = mirror the upstream signaling status")
 	flag.StringVar(&lanVersion, "lan-version", "", "experimental: advertised Bedrock version; empty = mirror the upstream signaling status")
@@ -96,6 +98,12 @@ func main() {
 	}
 	if lanUpstream != "" && lanDiscover == "" {
 		log.Fatal("--lan-upstream requires --lan-discover")
+	}
+	if lanMedia != "direct" && lanMedia != "assist" {
+		log.Fatal(`--lan-media must be "direct" or "assist"`)
+	}
+	if lanMedia == "assist" && lanUpstream == "" {
+		log.Fatal("--lan-media assist requires --lan-upstream")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -151,9 +159,23 @@ func main() {
 		run("nethernet signaling", func() error { return srv.Serve(ctx) })
 
 		if lanDiscover != "" && lanUpstream != "" {
+			var assistIP net.IP
+			if lanMedia == "assist" {
+				if mediaClientIP == "" {
+					log.Fatal("--lan-media assist requires --media-client-address")
+				}
+				assistIP = net.ParseIP(mediaClientIP)
+				if assistIP == nil || assistIP.To4() == nil {
+					log.Fatalf("--media-client-address %q is not an IPv4 address", mediaClientIP)
+				}
+			}
 			tunnel, err := netherproxy.NewLANTunnel(netherproxy.TunnelConfig{
 				BindAddr:     lanDiscover,
 				UpstreamAddr: lanUpstream,
+				MediaAssist:  lanMedia == "assist",
+				AdvertiseIP:  assistIP,
+				MediaBind:    mediaBind,
+				MediaIdleTTL: cfg.SessionIdleTTL,
 				Logger:       log.Default(),
 			})
 			if err != nil {

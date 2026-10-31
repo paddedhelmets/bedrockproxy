@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -152,4 +153,145 @@ func mustParseID(t *testing.T, id string) uint64 {
 		t.Fatal(err)
 	}
 	return parsed
+}
+
+// TestLANTunnelMediaAssistRewritesDockerCandidates verifies that with
+// MediaAssist, an upstream answer advertising an unroutable (Docker container)
+// candidate is rewritten to a proxy socket whose media reaches the upstream
+// host at the advertised port, bidirectionally.
+func TestLANTunnelMediaAssistRewritesDockerCandidates(t *testing.T) {
+	bdsAddr := freeUDPPort(t)
+	downAddr := freeUDPPort(t)
+
+	published, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = published.Close() })
+	publishedPort := published.LocalAddr().(*net.UDPAddr).Port
+
+	bdsSignals := make(chan *nethernet.Signal, 8)
+	bds, err := (discovery.ListenConfig{NetworkID: 424243}).Listen(bdsAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bds.Close()
+	bds.ServerData(&discovery.ServerData{
+		ServerName: "Docker Upstream", Protocol: 2225, Version: "1.26.61",
+		AcceptsSelfSignedAuth: true, ConnectionType: 4,
+	})
+	stopBDS := bds.Notify(captureNotifier{bdsSignals})
+	defer stopBDS()
+
+	tunnel, err := NewLANTunnel(TunnelConfig{
+		BindAddr:     downAddr,
+		UpstreamAddr: bdsAddr,
+		MediaAssist:  true,
+		AdvertiseIP:  net.IPv4(127, 0, 0, 1),
+		MediaBind:    "127.0.0.1:0",
+		Logger:       log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.Close()
+
+	clientSignals := make(chan *nethernet.Signal, 8)
+	client, err := (discovery.ListenConfig{
+		BroadcastAddress: mustUDP(t, downAddr),
+	}).Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	stopClient := client.Notify(captureNotifier{clientSignals})
+	defer stopClient()
+
+	// Wait for the client to receive the tunnel's republished advertisement
+	// (this also teaches the client the tunnel's signaling address).
+	deadline := time.Now().Add(tunnelTestDeadline)
+	for time.Now().Before(deadline) {
+		if _, ok := client.Responses()[mustParseID(t, tunnel.NetworkID())]; ok {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if _, ok := client.Responses()[mustParseID(t, tunnel.NetworkID())]; !ok {
+		t.Fatal("client never received the tunnel advertisement")
+	}
+
+	// Client offer passes through to the BDS.
+	if err := client.Signal(client.Context(), &nethernet.Signal{
+		Type: nethernet.SignalTypeOffer, NetworkID: tunnel.NetworkID(),
+		ConnectionID: 7, Data: "v=0\na=ice-ufrag:c\na=candidate:1 1 udp 1 192.168.1.50 52135 typ host\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-bdsSignals:
+	case <-time.After(tunnelTestDeadline):
+		t.Fatal("BDS never received the offer")
+	}
+
+	// The BDS answers with an unroutable Docker-style candidate.
+	answer := "v=0\na=ice-ufrag:s\na=candidate:1 1 udp 1 172.17.0.9 " + strconv.Itoa(publishedPort) + " typ host\n"
+	if err := bds.Signal(bds.Context(), &nethernet.Signal{
+		Type: nethernet.SignalTypeAnswer, NetworkID: tunnel.up.NetworkID(),
+		ConnectionID: 7, Data: answer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var rewritten string
+	select {
+	case s := <-clientSignals:
+		if s.ConnectionID != 7 || s.Type != nethernet.SignalTypeAnswer {
+			t.Fatalf("client received %+v", s)
+		}
+		rewritten = s.Data
+	case <-time.After(tunnelTestDeadline):
+		t.Fatal("client never received the answer")
+	}
+	if strings.Contains(rewritten, "172.17.0.9") || !strings.Contains(rewritten, "127.0.0.1") {
+		t.Fatalf("answer not rewritten: %q", rewritten)
+	}
+
+	// Extract the assist port from the rewritten candidate and drive media
+	// through it in both directions via the published port.
+	fields := strings.Fields(rewritten)
+	assistPort := 0
+	for i, f := range fields {
+		if f == "127.0.0.1" && i+1 < len(fields) {
+			assistPort, err = strconv.Atoi(fields[i+1])
+			if err == nil {
+				break
+			}
+		}
+	}
+	if assistPort == 0 {
+		t.Fatalf("no rewritten candidate found in %q", rewritten)
+	}
+
+	mediaClient, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mediaClient.Close() })
+	assistAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: assistPort}
+	if _, err := mediaClient.WriteToUDP([]byte("media-up"), assistAddr); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 128)
+	_ = published.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := published.ReadFromUDP(buf)
+	if err != nil || string(buf[:n]) != "media-up" {
+		t.Fatalf("published socket: n=%d err=%v body=%q", n, err, string(buf[:n]))
+	}
+	if _, err := published.WriteToUDP([]byte("media-down"), assistAddr); err != nil {
+		t.Fatal(err)
+	}
+	_ = mediaClient.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err = mediaClient.ReadFromUDP(buf)
+	if err != nil || string(buf[:n]) != "media-down" {
+		t.Fatalf("media client: n=%d err=%v body=%q", n, err, string(buf[:n]))
+	}
 }
