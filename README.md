@@ -1,8 +1,10 @@
 # bedrockproxy
 
-Advertise any **remote** Minecraft Bedrock server as a **LAN game** on your local
-network, so devices that can't add external servers by address — Xbox,
-PlayStation, Switch — discover and join it from the Friends / LAN tab.
+Relay a remote Minecraft Bedrock server to clients on your local network. RakNet
+mode advertises a LAN game; the separate Switch DNS mode redirects featured-server
+lookups. NetherNet mode relays HTTP signaling and UDP media, and can optionally
+bridge NetherNet LAN discovery (`--lan-discover`, experimental) so LAN clients
+find the proxy without manual server entry.
 
 This is a self-hosted, ad-free replacement for the **BedrockTogether** phone app,
 run as a small persistent service on a device that lives on the same LAN as the
@@ -58,7 +60,10 @@ the byte-exact protocol spec.
 
 ## Build
 
-Requires Go 1.22+.
+Requires Go 1.25+ when building from source. GitHub Actions also builds downloadable
+artifacts for each successful run; open the commit's **Actions** run and download
+the `bedrockproxy-<commit>` artifact. It contains platform binaries and
+`SHA256SUMS`; repository access is required.
 
 ```sh
 go build -o bedrockproxy .          # the proxy
@@ -71,9 +76,9 @@ go build -o bedping ./cmd/bedping   # the ping/debug client
 # NetherNet signaling relay (default)
 ./bedrockproxy --protocol nethernet --bind :19132 \
   --remote-signal-url http://dad.example.com:19132 \
-  --media-bind :49152 \
+  --media-bind :0 \
   --media-client-address 192.168.1.20 \
-  --media-upstream-address 100.112.54.3
+  --media-upstream-address 100.100.100.2
 
 # Legacy RakNet relay
 ./bedrockproxy --protocol raknet --remote dad.example.com:19132 --motd "Granddad's World"
@@ -84,17 +89,22 @@ Flags:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--protocol` | `nethernet` | `nethernet` signaling relay or legacy `raknet` UDP relay. |
-| `--remote` | *(required)* | RakNet `host:port`, or NetherNet signaling URL/host:port. |
+| `--remote` | *(empty)* | RakNet `host:port`, or NetherNet signaling URL/host:port; required for a relay unless NetherNet `--remote-signal-url` is set. |
 | `--remote-signal-url` | *(empty)* | Explicit NetherNet upstream signaling URL; overrides `--remote`. |
 | `--bind` | `:19132` | TCP signaling bind in NetherNet mode; UDP bind in RakNet mode. |
-| `--media-bind` | `:0` | UDP relay bind for NetherNet media. Use a fixed port/range policy if firewalls require it. |
+| `--media-bind` | `:0` | UDP relay bind for NetherNet media. Each session needs its own port; a fixed port prevents concurrent sessions. Port ranges are not supported. |
 | `--media-client-address` | *(required)* | IPv4 address visible to Bedrock clients. |
 | `--media-upstream-address` | *(required)* | IPv4 address visible to the upstream BDS. |
+| `--lan-discover` | *(off)* | Experimental: UDP bind for the NetherNet LAN discovery/signaling bridge (e.g. `:7551`). Trusted LAN only; unvalidated on console hardware. |
+| `--lan-network-id` | *(random)* | Experimental: LAN discovery network ID. |
+| `--lan-protocol` | *(mirror)* | Experimental: advertised protocol override. |
+| `--lan-version` | *(mirror)* | Experimental: advertised version override. |
+| `--lan-auth` | `online` | Experimental: advertised auth policy: `online`, `self-signed`, or `both`. |
 | `--motd` | *(mirror remote)* | MOTD line 1 shown in the server list. |
 | `--sub-motd` | *(mirror remote)* | MOTD line 2 (subtitle). |
 | `--protocol-version` | *(mirror remote)* | Legacy RakNet MOTD protocol override. |
 | `--refresh` | `60s` | Re-probe the remote's MOTD (player counts, version) every N; `0` = once. |
-| `--idle-timeout` | `5m` | Drop idle console sessions after this long. |
+| `--idle-timeout` | `5m` | Drop idle RakNet sessions or NetherNet media relays after this long. NetherNet treats `0` as its default of `5m`. |
 | `--dns-listen` | *(off)* | Enable **Switch mode**: UDP address for the DNS server (e.g. `:53`). Empty = off. |
 | `--dns-target-ip` | *(auto)* | IP returned for pinned featured-server domains (the proxy's LAN IP). |
 | `--dns-upstream` | `1.1.1.1:53` | Upstream resolver for non-pinned queries (keeps the rest of the LAN resolving). |
@@ -103,9 +113,28 @@ RakNet mode mirrors the remote protocol/version by default, so as
 long as your consoles and the remote run the same Bedrock version they'll join
 cleanly.
 
-NetherNet mode rewrites candidate addresses and relays encrypted UDP media, so
-clients do not need Tailnet access. Set the two media addresses to the proxy's
-client-facing and upstream-facing interfaces respectively.
+NetherNet mode requires a compatible HTTP signaling endpoint; a normal RakNet
+Bedrock server address is not automatically such an endpoint. Set the two media
+addresses to reachable proxy IPv4 addresses for the client and upstream sides,
+and allow the dynamically allocated UDP ports through any firewalls/NAT. The
+relay rewrites SDP candidates but does not guarantee NAT traversal. Real-console
+interoperability requires validation in the target environment; a mobile client
+has joined through the relay, but console discovery via `--lan-discover` is
+experimental and unverified on hardware.
+
+Treat the NetherNet signaling listener as trusted-LAN-only: it is unauthenticated,
+and a signaling client can direct UDP checks to supplied candidate addresses. Do not
+expose it to the public internet. A wildcard media bind also relies on OS routing
+to choose the source address; on a multihomed host, verify that packets leave
+with the addresses advertised to each peer.
+
+**Migration:** The CLI now defaults to NetherNet. Existing RakNet commands must
+add `--protocol raknet`, including DNS mode. The old numeric `--protocol 2169`
+still selects RakNet and overrides its advertised protocol; prefer
+`--protocol raknet --protocol-version 2169`. An updated systemd unit defaults
+missing `PROTOCOL` to RakNet for existing environment files; new example
+environment files explicitly select NetherNet. Review the environment before
+restarting, especially if replacing it with the new example.
 
 ## Deploy to a family LAN (the common case)
 
@@ -114,11 +143,11 @@ On a Pi / mini-PC on the consoles' network:
 ```sh
 # Download the matching build from https://github.com/paddedhelmets/bedrockproxy/releases
 # (or build from source: GOOS=linux GOARCH=arm64 go build .)
-./bedrockproxy --remote dad.example.com:19132 --motd "Granddad's World"
+./bedrockproxy --protocol raknet --remote dad.example.com:19132 --motd "Granddad's World"
 ```
 
-Or as a systemd service (see `deploy/bedrockproxy.service`). That's it — every
-Bedrock client on that LAN now sees the game under LAN/Friends.
+Or as a systemd service (see `deploy/README.md`). LAN discovery depends on the
+client and network; console hardware validation remains outstanding.
 
 ## Nintendo Switch (DNS mode)
 
@@ -132,7 +161,7 @@ Run the proxy with DNS enabled (needs UDP 53; the systemd unit grants
 `CAP_NET_BIND_SERVICE`):
 
 ```sh
-sudo ./bedrockproxy --remote dad.example.com:19132 --dns-listen :53
+sudo ./bedrockproxy --protocol raknet --remote dad.example.com:19132 --dns-listen :53
 ```
 
 Then point Switches at the DNS — **two ways, same proxy**:
@@ -153,12 +182,14 @@ IPv6 resolver you don't control) — set the Switch's DNS explicitly as a fallba
 
 | Platform | LAN relay |
 |----------|-----------|
-| Win10/11, iOS, Android | ✅ (can also add servers manually) |
-| Xbox | ✅ |
-| PS4 / PS5 | ✅ (PS5 has a known LAN-detection quirk, MCPE-239057) |
-| **Switch** | ✅ via DNS mode (`--dns-listen :53`) — no LAN broadcast on Switch; it reaches the proxy through the Featured Servers list |
+| Win10/11, iOS, Android | RakNet LAN discovery; can also add servers manually |
+| Xbox | RakNet LAN discovery, real-console validation pending |
+| PS4 / PS5 | RakNet LAN discovery, real-console validation pending |
+| **Switch** | RakNet DNS redirect (`--dns-listen :53`), real-console validation pending |
 
-The proxy advertises on the standard Bedrock broadcast (`255.255.255.255:19132`).
+RakNet mode responds to discovery pings on UDP port 19132; it does not proactively
+broadcast announcements. DNS redirection depends on featured-server hostnames and
+client behavior, which may change.
 
 ## Roadmap
 
