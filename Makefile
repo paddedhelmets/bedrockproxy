@@ -1,15 +1,18 @@
-.PHONY: all bedrockproxy bedping vet test dist clean
+.PHONY: all bedrockproxy bedping lanprobe vet test dist clean
 
 TARGETS := linux/amd64 linux/arm64 linux/armv7 darwin/amd64 darwin/arm64 windows/amd64
 LDFLAGS := -s -w
 
-all: bedrockproxy bedping
+all: bedrockproxy bedping lanprobe
 
 bedrockproxy:
 	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bedrockproxy .
 
 bedping:
 	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bedping ./cmd/bedping
+
+lanprobe:
+	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o lanprobe ./cmd/lanprobe
 
 vet:
 	go vet ./...
@@ -31,6 +34,8 @@ dist:
 	    -o "dist/bedrockproxy-$${goos}-$${rest}$${ext}" .; \
 	  GOOS=$$goos GOARCH=$$goarch GOARM=$$goarm CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" \
 	    -o "dist/bedping-$${goos}-$${rest}$${ext}" ./cmd/bedping; \
+	  GOOS=$$goos GOARCH=$$goarch GOARM=$$goarm CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" \
+	    -o "dist/lanprobe-$${goos}-$${rest}$${ext}" ./cmd/lanprobe; \
 	done
 	@echo "--- dist/ ---" && ls -la dist
 
