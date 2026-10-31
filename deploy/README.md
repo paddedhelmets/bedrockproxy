@@ -20,7 +20,7 @@ Pick the matching build from `dist/` (or build on the box with Go ≥1.22):
 sudo install -m 0755 bedrockproxy-linux-arm64 /usr/local/bin/bedrockproxy
 sudo mkdir -p /etc/bedrockproxy
 sudo cp deploy/bedrockproxy.env /etc/bedrockproxy/bedrockproxy.env
-sudoedit /etc/bedrockproxy/bedrockproxy.env   # set REMOTE, MOTD
+sudoedit /etc/bedrockproxy/bedrockproxy.env   # set PROTOCOL, REMOTE, MOTD
 ```
 
 ## 2. Install the service
@@ -34,15 +34,21 @@ sudo systemctl enable --now bedrockproxy
 sudo journalctl -u bedrockproxy -f
 ```
 
-You should see `bedrockproxy up: :19132 -> <REMOTE> ...`.
+RakNet mode logs `bedrockproxy up: :19132 -> <REMOTE> ...`.
+NetherNet mode logs `nethernet signaling relay up: :19132 -> <REMOTE> ...`.
 
 ## 3. Open the firewall (if any)
 
-Allow inbound UDP 19132 on the LAN interface only:
+RakNet mode requires inbound UDP 19132 on the LAN interface:
 
 ```sh
 sudo ufw allow in on eth0 to any port 19132 proto udp   # adjust iface name
 ```
+
+NetherNet mode requires inbound TCP on the signaling bind and inbound UDP on the
+media relay bind. Set `MEDIA_CLIENT_ADDRESS` to the proxy's LAN address and
+`MEDIA_UPSTREAM_ADDRESS` to its Tailnet/public address. The proxy rewrites SDP
+candidates and forwards encrypted UDP media between those interfaces.
 
 ## 4. Join
 
@@ -52,7 +58,7 @@ server.
 
 ## Troubleshooting
 
-- **Game doesn't appear:** the proxy must bind `:19132` (consoles scan that port).
+- **Legacy game doesn't appear:** RakNet mode must bind `:19132` (consoles scan that port).
   Check `--bind` and that nothing else holds 19132 (`sudo ss -lun | grep 19132`).
 - **"Could not connect: Outdated client/server":** your console and the remote
   server run different Bedrock versions. Keep them on the same version; the proxy
