@@ -26,10 +26,11 @@ func (signalLogger) NotifySignal(s *nethernet.Signal) bool {
 
 func main() {
 	var target string
-	var wait time.Duration
+	var waitSeconds int
 	flag.StringVar(&target, "target", "127.0.0.1:7551", "UDP address of the NetherNet LAN host to probe")
-	flag.DurationVar(&wait, "wait", 3*time.Second, "how long to wait for discovery responses")
+	flag.IntVar(&waitSeconds, "wait", 3, "seconds to wait for discovery responses")
 	flag.Parse()
+	wait := time.Duration(waitSeconds) * time.Second
 
 	addr, err := net.ResolveUDPAddr("udp4", target)
 	if err != nil {
