@@ -21,8 +21,14 @@ spoofing a LAN game. `bedrockproxy` does the same job, but:
 
 ## How it works
 
-The proxy listens on the Bedrock port (UDP `19132`) on the LAN. For each console
-that probes the LAN it does two things:
+The proxy supports two transport modes. `--protocol nethernet` is the default and
+relays NetherNet HTTP signaling plus an encrypted ICE/UDP media relay. `--protocol
+raknet` retains the legacy UDP behavior. NetherNet identity, DTLS, SCTP, and
+Bedrock payloads remain end-to-end opaque; only SDP candidate addresses and UDP
+packets are relayed.
+
+In RakNet mode, the proxy listens on the Bedrock port (UDP `19132`) on the LAN.
+For each console that probes the LAN it does two things:
 
 1. **Spoofed discovery** — answers RakNet `ID_UNCONNECTED_PING` broadcasts with a
    `PONG` whose MOTD advertises your chosen remote server (it mirrors the remote's
@@ -75,27 +81,44 @@ go build -o bedping ./cmd/bedping   # the ping/debug client
 ## Run
 
 ```sh
-./bedrockproxy --remote dad.example.com:19132 --motd "Granddad's World"
+# NetherNet signaling relay (default)
+./bedrockproxy --protocol nethernet --bind :19132 \
+  --remote-signal-url http://dad.example.com:19132 \
+  --media-bind :49152 \
+  --media-client-address 192.168.1.20 \
+  --media-upstream-address 100.112.54.3
+
+# Legacy RakNet relay
+./bedrockproxy --protocol raknet --remote dad.example.com:19132 --motd "Granddad's World"
 ```
 
 Flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--remote` | *(required)* | Remote Bedrock server `host:port` to advertise & relay to. |
-| `--bind` | `:19132` | LAN-facing UDP listen address. |
+| `--protocol` | `nethernet` | `nethernet` signaling relay or legacy `raknet` UDP relay. |
+| `--remote` | *(required)* | RakNet `host:port`, or NetherNet signaling URL/host:port. |
+| `--remote-signal-url` | *(empty)* | Explicit NetherNet upstream signaling URL; overrides `--remote`. |
+| `--bind` | `:19132` | TCP signaling bind in NetherNet mode; UDP bind in RakNet mode. |
+| `--media-bind` | `:0` | UDP relay bind for NetherNet media. Use a fixed port/range policy if firewalls require it. |
+| `--media-client-address` | *(required)* | IPv4 address visible to Bedrock clients. |
+| `--media-upstream-address` | *(required)* | IPv4 address visible to the upstream BDS. |
 | `--motd` | *(mirror remote)* | MOTD line 1 shown in the server list. |
 | `--sub-motd` | *(mirror remote)* | MOTD line 2 (subtitle). |
-| `--protocol` | *(mirror remote)* | Protocol version number; override only if you know it. |
+| `--protocol-version` | *(mirror remote)* | Legacy RakNet MOTD protocol override. |
 | `--refresh` | `60s` | Re-probe the remote's MOTD (player counts, version) every N; `0` = once. |
 | `--idle-timeout` | `5m` | Drop idle console sessions after this long. |
 | `--dns-listen` | *(off)* | Enable **Switch mode**: UDP address for the DNS server (e.g. `:53`). Empty = off. |
 | `--dns-target-ip` | *(auto)* | IP returned for pinned featured-server domains (the proxy's LAN IP). |
 | `--dns-upstream` | `1.1.1.1:53` | Upstream resolver for non-pinned queries (keeps the rest of the LAN resolving). |
 
-By default the advertised protocol/version **mirror the remote server**, so as
+RakNet mode mirrors the remote protocol/version by default, so as
 long as your consoles and the remote run the same Bedrock version they'll join
 cleanly.
+
+NetherNet mode rewrites candidate addresses and relays encrypted UDP media, so
+clients do not need Tailnet access. Set the two media addresses to the proxy's
+client-facing and upstream-facing interfaces respectively.
 
 ## Deploy to a family LAN (the common case)
 

@@ -14,7 +14,12 @@ Group=bedrockproxy
 # Edit deploy/bedrockproxy.env (REMOTE is required).
 EnvironmentFile=/etc/bedrockproxy/bedrockproxy.env
 ExecStart=/usr/local/bin/bedrockproxy \
+    --protocol "${PROTOCOL}" \
     --remote "${REMOTE}" \
+    --remote-signal-url "${REMOTE_SIGNAL_URL}" \
+    --media-bind "${MEDIA_BIND}" \
+    --media-client-address "${MEDIA_CLIENT_ADDRESS}" \
+    --media-upstream-address "${MEDIA_UPSTREAM_ADDRESS}" \
     --motd "${MOTD}" \
     --bind "${BIND}" \
     --dns-listen "${DNS_LISTEN}" \
