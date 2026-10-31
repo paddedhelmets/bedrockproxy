@@ -93,6 +93,34 @@ addition to real-client testing, future work needs to:
 - bridge LAN discovery and trickle-ICE signaling to the HTTP endpoint;
 - validate ICE routing and multihomed source addresses in the intended topology.
 
+## LAN Bridge Status (2026-10-31 hardware test)
+
+The experimental LAN bridge (`--lan-discover`) was validated on real clients up
+to the upstream identity wall:
+
+- Discovery advertisement works: a LAN client sees the bridged world and
+  attempts to join (client and proxy coexist on UDP 7551; only hosts bind it).
+- Offer translation works: the client's LAN offer (trickled candidates merged)
+  reaches the upstream HTTP endpoint intact through the relay.
+- **Blocked at upstream policy:** LAN clients do not attach an `a=identity`
+  GameServerToken assertion to their SDP offers (LAN uses the nonce/auth-flag
+  identity model instead). Mojang BDS rejects assertion-less offers with
+  NetherNet error 37 (`IdentityNotAllowed`), observed in a packet capture as a
+  2-byte `37` response body. The onboarding guide makes acceptance a server
+  policy decision; no server.properties knob relaxes it, and the bridge cannot
+  mint the player's assertion (it never holds player keys).
+
+Consequence: LAN-discovery bridging to a Mojang BDS upstream is architecturally
+blocked until Mojang offers a permissive policy or an undocumented knob is
+found. Clients that do their own HTTP signaling (manual server entry on Win/
+mobile — validated working through the relay, including two simultaneous
+sessions) mint assertions naturally, which makes the Switch featured-server DNS
+redirect path (`--dns-listen`, now transport-independent) the most promising
+remaining console route: it steers the client onto the HTTP path where
+assertions exist. Open Switch questions: HTTPS-to-featured-servers behavior
+(certificate wall for DNS-only redirection) and TOFU prompt behavior on
+plaintext HTTP.
+
 Candidate implementation references include `df-mc/go-nethernet` (Go, MIT) and
 `PrismarineJS/node-nethernet` (Node, MIT). Both are active but NetherNet support
 is still newer than the old RakNet stack.
