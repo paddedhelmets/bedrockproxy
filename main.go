@@ -26,22 +26,33 @@ import (
 	"time"
 
 	"github.com/paddedhelmets/bedrockproxy/dns"
+	"github.com/paddedhelmets/bedrockproxy/netherproxy"
 	"github.com/paddedhelmets/bedrockproxy/proxy"
 )
 
 func main() {
 	var (
-		cfg         proxy.Config
-		dnsListen   string
-		dnsUpstream string
-		dnsTargetIP string
+		cfg             proxy.Config
+		protocolText    string
+		remoteSignalURL string
+		mediaBind       string
+		mediaClientIP   string
+		mediaUpstreamIP string
+		dnsListen       string
+		dnsUpstream     string
+		dnsTargetIP     string
 	)
+	flag.StringVar(&protocolText, "protocol", string(protocolNetherNet), "transport protocol: raknet or nethernet (default: nethernet)")
 	// Relay / LAN mode.
-	flag.StringVar(&cfg.BindAddr, "bind", ":19132", "LAN-facing UDP listen address for the RakNet relay")
-	flag.StringVar(&cfg.RemoteAddr, "remote", "", "remote Bedrock server host:port to advertise & relay to (enables LAN relay)")
+	flag.StringVar(&cfg.BindAddr, "bind", ":19132", "listen address (UDP for RakNet, TCP for NetherNet signaling)")
+	flag.StringVar(&cfg.RemoteAddr, "remote", "", "remote Bedrock server host:port (RakNet) or signaling URL/host:port (NetherNet)")
+	flag.StringVar(&remoteSignalURL, "remote-signal-url", "", "upstream NetherNet signaling URL; defaults to --remote in NetherNet mode")
+	flag.StringVar(&mediaBind, "media-bind", ":0", "NetherNet UDP relay bind address")
+	flag.StringVar(&mediaClientIP, "media-client-address", "", "IPv4 address advertised to Bedrock clients for NetherNet UDP")
+	flag.StringVar(&mediaUpstreamIP, "media-upstream-address", "", "IPv4 address advertised to the upstream NetherNet server for UDP")
 	flag.StringVar(&cfg.Motd, "motd", "", "MOTD line 1; empty mirrors the remote server")
 	flag.StringVar(&cfg.SubMotd, "sub-motd", "", "MOTD line 2; empty mirrors the remote server")
-	flag.StringVar(&cfg.ProtocolVer, "protocol", "", "protocol version; empty mirrors the remote server")
+	flag.StringVar(&cfg.ProtocolVer, "protocol-version", "", "RakNet MOTD protocol version override; empty mirrors the remote server")
 	flag.DurationVar(&cfg.RefreshEvery, "refresh", 60*time.Second, "re-probe remote MOTD interval; 0 = only at startup")
 	flag.DurationVar(&cfg.SessionIdleTTL, "idle-timeout", 5*time.Minute, "drop idle console sessions after this long")
 	// Switch DNS mode.
@@ -49,11 +60,18 @@ func main() {
 	flag.StringVar(&dnsUpstream, "dns-upstream", "1.1.1.1:53", "upstream resolver for non-pinned DNS queries")
 	flag.StringVar(&dnsTargetIP, "dns-target-ip", "", "IP returned for pinned featured-server domains (the proxy's LAN IP); empty = auto-detect")
 	flag.Parse()
+	transport, err := parseTransportProtocol(protocolText)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	if cfg.RemoteAddr == "" && dnsListen == "" {
+	if cfg.RemoteAddr == "" && remoteSignalURL == "" && dnsListen == "" {
 		log.Fatal("must set at least one of --remote (LAN relay) or --dns-listen (Switch DNS mode)")
+	}
+	if transport == protocolNetherNet && dnsListen != "" {
+		log.Fatal("--dns-listen is only supported with --protocol raknet")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -81,12 +99,31 @@ func main() {
 	}
 
 	// LAN relay: Xbox / PlayStation / Windows / mobile (and Switch once DNS points here).
-	if cfg.RemoteAddr != "" {
+	if transport == protocolRakNet && cfg.RemoteAddr != "" {
 		srv, err := proxy.New(cfg)
 		if err != nil {
 			log.Fatalf("proxy init: %v", err)
 		}
 		run("relay", func() error { return srv.Serve(ctx) })
+	}
+
+	if transport == protocolNetherNet {
+		remote := remoteSignalURL
+		if remote == "" {
+			remote = cfg.RemoteAddr
+		}
+		srv, err := netherproxy.New(netherproxy.Config{
+			BindAddr:              cfg.BindAddr,
+			RemoteURL:             remote,
+			MediaBind:             mediaBind,
+			ClientAdvertiseAddr:   mediaClientIP,
+			UpstreamAdvertiseAddr: mediaUpstreamIP,
+			Logger:                log.Default(),
+		})
+		if err != nil {
+			log.Fatalf("nethernet init: %v", err)
+		}
+		run("nethernet signaling", func() error { return srv.Serve(ctx) })
 	}
 
 	// Switch DNS mode: pin featured-server domains to this proxy.
