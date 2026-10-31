@@ -1,17 +1,8 @@
 // Package dns implements a minimal UDP DNS server that pins a set of domains to a
 // fixed IP and forwards all other queries verbatim to an upstream resolver.
 //
-// It lets the proxy advertise itself to a Nintendo Switch: the Switch can only
-// reach custom servers through its curated "Featured Servers" list, whose
-// hostnames it resolves via DNS. Resolving those hostnames to the proxy's LAN IP
-// makes the Switch connect to the proxy (believing it hit a featured server); the
-// proxy's RakNet relay then carries the session to the real remote server.
-//
-// The same server supports both Switch-deployment styles the operator wants:
-//
-//   - per-Switch:  each Switch's primary DNS → proxy IP (secondary e.g. 1.1.1.1)
-//   - LAN-wide:    router/DHCP DNS → proxy IP; unknown queries are forwarded, so
-//                  the rest of the LAN's DNS keeps working unchanged
+// DNS pinning can be used independently of the relay transport. It does not
+// establish compatibility with any particular client or signaling protocol.
 //
 // It is intentionally dependency-free and UDP-only — sufficient for an A-record
 // hijack plus blind byte-for-forwarding. Only IPv4 (A) records are pinned.
@@ -63,6 +54,9 @@ type Server struct {
 // New binds the UDP listen socket. domains are pinned (exact or suffix match) to
 // targetIP; everything else is forwarded to upstream (default 1.1.1.1:53).
 func New(listenAddr string, targetIP net.IP, domains []string, upstream string, logger *log.Logger) (*Server, error) {
+	if targetIP.To4() == nil {
+		return nil, errors.New("dns target IP must be IPv4")
+	}
 	if logger == nil {
 		logger = log.Default()
 	}

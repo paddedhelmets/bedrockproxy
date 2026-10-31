@@ -5,7 +5,8 @@
 Bedrock 26.60 removed RakNet client support. `bedrockproxy` currently implements
 RakNet discovery and a transparent RakNet UDP relay, so it cannot carry a 26.60
 client session. Changing the advertised MOTD protocol number cannot fix this:
-the client now expects NetherNet HTTP signaling followed by WebRTC data channels.
+the client now expects NetherNet signaling followed by WebRTC data channels. HTTP
+signaling and LAN discovery/signaling are distinct paths.
 
 Evidence:
 
@@ -75,18 +76,22 @@ port per client, while a fixed port is useful for a one-client lab test.
 
 The relay preserves identity and DTLS fingerprints, rewrites the candidate
 addresses to the proxy's client/upstream interfaces, and forwards encrypted UDP
-packets without inspecting WebRTC or Bedrock payloads. Clients therefore do not
-need Tailnet access.
+packets without inspecting Bedrock payloads. ICE checks are inspected for routing.
+The intended configuration does not require clients to have Tailnet access, but
+real-client connectivity has not been verified. Restrict signaling to a trusted LAN;
+it is unauthenticated and can be abused to send UDP checks to candidate addresses.
 
 ## Proxy Implication
 
 Supporting current clients requires a NetherNet transport path, not a small
-RakNet patch. The v0.2 relay now handles the transparent ICE path. A future
-enhancement may still need to:
+RakNet patch. The experimental HTTP relay does not implement LAN discovery or
+LAN signaling, so it cannot yet deliver the console LAN-game workflow. In
+addition to real-client testing, future work needs to:
 
 - validate client identity assertions at the proxy boundary;
 - support external STUN/TURN and IPv6 candidate mappings;
-- optionally retain the old RakNet path for pre-26.60 clients.
+- bridge LAN discovery and trickle-ICE signaling to the HTTP endpoint;
+- validate ICE routing and multihomed source addresses in the intended topology.
 
 Candidate implementation references include `df-mc/go-nethernet` (Go, MIT) and
 `PrismarineJS/node-nethernet` (Node, MIT). Both are active but NetherNet support

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -21,4 +22,16 @@ func parseTransportProtocol(value string) (transportProtocol, error) {
 	default:
 		return "", fmt.Errorf("invalid --protocol %q (want raknet or nethernet)", value)
 	}
+}
+
+// A numeric --protocol was historically the RakNet MOTD protocol override.
+func resolveProtocol(value, version string) (transportProtocol, string, error) {
+	if _, err := strconv.ParseUint(value, 10, 32); err == nil {
+		if version != "" && version != value {
+			return "", "", fmt.Errorf("numeric --protocol conflicts with --protocol-version")
+		}
+		return protocolRakNet, value, nil
+	}
+	transport, err := parseTransportProtocol(value)
+	return transport, version, err
 }
