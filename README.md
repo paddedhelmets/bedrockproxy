@@ -31,6 +31,14 @@ that probes the LAN it does two things:
    session: connection handshake, framed data, ECDH/AES handshake bytes), it
    shuttles bytes between the console and the remote server verbatim.
 
+3. **NetherNet relay** (Bedrock 26.50+ servers; 26.60+ clients speak *only*
+   NetherNet) — on **TCP** `19132` it relays the HTTP signaling (`GET /v1/join`,
+   `POST /v1/join/{id}`) to the remote, rewriting the WebRTC ICE candidates so the
+   console and the server each see the proxy as the other's only address. Media
+   (STUN/DTLS/SCTP) then arrives on the same UDP `19132` socket, is matched to its
+   session by ICE username, and is shuttled to the server's media port. DTLS is
+   end-to-end, so the server's Xbox auth is untouched.
+
 A relay is *required*, not optional: a RakNet pong has no address field, so the
 console connects back to the **source IP of the pong** — i.e. the proxy — which
 must then forward the traffic to the real server. Verified across the original
@@ -45,6 +53,11 @@ the byte-exact protocol spec.
  (Switch/Xbox/PS5)  │ spoofs LAN pong              (your VPS / dad's box)
                     └ relays game datagrams both ways, per console
 ```
+
+> **Firewall:** open **UDP and TCP** `19132` on the proxy (TCP carries NetherNet
+> signaling), and make sure the proxy can reach the server's TCP `19132` and its
+> NetherNet UDP media port (see `server-udp-ports` in the server's
+> `server.properties`; the proxy logs the port it relays to on each join).
 
 > **Important:** the proxy must run on a device **on the target LAN**. A cloud
 > box that isn't on the consoles' broadcast domain can't do LAN discovery —
@@ -144,6 +157,8 @@ The proxy advertises on the standard Bedrock broadcast (`255.255.255.255:19132`)
 - [x] Remote MOTD mirroring
 - [x] **Switch DNS mode** — featured-server redirect, per-Switch or LAN-wide (router DNS)
 - [x] Cross-compiled release binaries (linux arm64/amd64, macOS, windows)
+- [x] NetherNet relay (signaling + ICE candidate rewrite + UDP media), for 26.60+ clients
+- [ ] NetherNet LAN discovery (UDP 7551) — until then, Xbox/PS use DNS mode too
 - [ ] Proactive LAN pong broadcaster (faster discovery for some clients)
 - [ ] Real-console hardware validation (Switch via DNS; Xbox/PS via LAN)
 - [ ] Optional web/TUI status (sessions, bandwidth)
