@@ -78,6 +78,9 @@ type assistRelay struct {
 	target *net.UDPAddr
 	mu     sync.Mutex
 	client *net.UDPAddr
+	// touch refreshes the owning route's idle timestamp so active media
+	// keeps the route (and this relay) alive. Nil after the route is gone.
+	touch  func()
 	log    *log.Logger
 	closed chan struct{}
 	once   sync.Once
@@ -93,6 +96,9 @@ func (a *assistRelay) pump(ttl time.Duration) {
 			return
 		}
 		_ = a.conn.SetReadDeadline(time.Now().Add(ttl))
+		if a.touch != nil {
+			a.touch()
+		}
 		if src.IP.Equal(a.target.IP) && src.Port == a.target.Port {
 			a.mu.Lock()
 			client := a.client
@@ -350,6 +356,7 @@ func (t *LANTunnel) assistAnswer(connID uint64, answer string) (string, error) {
 	}
 	target := &net.UDPAddr{IP: t.upAddr.IP, Port: candidates[0].Port}
 	a := &assistRelay{conn: conn, target: target, log: t.log, closed: make(chan struct{})}
+	a.touch = func() { t.touchRoute(connID) }
 	t.mu.Lock()
 	if r, ok := t.routes[connID]; ok {
 		r.assist = a
@@ -360,6 +367,17 @@ func (t *LANTunnel) assistAnswer(connID uint64, answer string) (string, error) {
 	t.log.Printf("nethernet lan tunnel: connection %d media via %s:%d -> %s (advertised %s)",
 		connID, t.advertise, port, target, candidates[0].String())
 	return rewritten, nil
+}
+
+// touchRoute marks a connection's route as active. Media traffic calls this
+// through the assist relay so live sessions are never reaped as idle.
+func (t *LANTunnel) touchRoute(id uint64) {
+	t.mu.Lock()
+	if r, ok := t.routes[id]; ok {
+		r.lastSeen = time.Now()
+		t.routes[id] = r
+	}
+	t.mu.Unlock()
 }
 
 func (t *LANTunnel) sweepRoutes() {

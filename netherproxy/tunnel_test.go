@@ -295,3 +295,156 @@ func TestLANTunnelMediaAssistRewritesDockerCandidates(t *testing.T) {
 		t.Fatalf("media client: n=%d err=%v body=%q", n, err, string(buf[:n]))
 	}
 }
+
+// TestAssistMediaKeepsRouteAlive verifies that media traffic refreshing a
+// route prevents the idle sweeper from closing a live assist relay, while a
+// genuinely idle route is still reaped. Regression test for sessions dying
+// routeTTL after join despite active gameplay.
+func TestAssistMediaKeepsRouteAlive(t *testing.T) {
+	bdsAddr := freeUDPPort(t)
+	downAddr := freeUDPPort(t)
+
+	published, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = published.Close() })
+	publishedPort := published.LocalAddr().(*net.UDPAddr).Port
+
+	bds, err := (discovery.ListenConfig{NetworkID: 424244}).Listen(bdsAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bds.Close()
+	bds.ServerData(&discovery.ServerData{
+		ServerName: "Idle Reaper", Protocol: 2225, Version: "1.26.61",
+		AcceptsSelfSignedAuth: true, ConnectionType: 4,
+	})
+	bdsSignals := make(chan *nethernet.Signal, 8)
+	stopBDS := bds.Notify(captureNotifier{bdsSignals})
+	defer stopBDS()
+
+	const routeTTL = 600 * time.Millisecond
+	tunnel, err := NewLANTunnel(TunnelConfig{
+		BindAddr:     downAddr,
+		UpstreamAddr: bdsAddr,
+		RouteTTL:     routeTTL,
+		MediaAssist:  true,
+		AdvertiseIP:  net.IPv4(127, 0, 0, 1),
+		MediaBind:    "127.0.0.1:0",
+		MediaIdleTTL: 10 * time.Second,
+		Logger:       log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.Close()
+
+	client, err := (discovery.ListenConfig{
+		BroadcastAddress: mustUDP(t, downAddr),
+	}).Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	clientSignals := make(chan *nethernet.Signal, 8)
+	stopClient := client.Notify(captureNotifier{clientSignals})
+	defer stopClient()
+
+	// Complete discovery + offer/answer to establish a routed assist relay.
+	deadline := time.Now().Add(tunnelTestDeadline)
+	for time.Now().Before(deadline) {
+		if _, ok := client.Responses()[mustParseID(t, tunnel.NetworkID())]; ok {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := client.Signal(client.Context(), &nethernet.Signal{
+		Type: nethernet.SignalTypeOffer, NetworkID: tunnel.NetworkID(),
+		ConnectionID: 9, Data: "v=0\na=ice-ufrag:c\na=candidate:1 1 udp 1 192.168.1.50 52135 typ host\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-bdsSignals:
+	case <-time.After(tunnelTestDeadline):
+		t.Fatal("BDS never received the offer")
+	}
+	answer := "v=0\na=ice-ufrag:s\na=candidate:1 1 udp 1 172.17.0.9 " + strconv.Itoa(publishedPort) + " typ host\n"
+	if err := bds.Signal(bds.Context(), &nethernet.Signal{
+		Type: nethernet.SignalTypeAnswer, NetworkID: tunnel.up.NetworkID(),
+		ConnectionID: 9, Data: answer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case s := <-clientSignals:
+		if s.ConnectionID != 9 {
+			t.Fatalf("client received %+v", s)
+		}
+	case <-time.After(tunnelTestDeadline):
+		t.Fatal("client never received the rewritten answer")
+	}
+
+	tunnel.mu.Lock()
+	r, ok := tunnel.routes[9]
+	tunnel.mu.Unlock()
+	if !ok || r.assist == nil {
+		t.Fatal("route with assist not established")
+	}
+	assist := r.assist
+
+	// Find the assist port from the tunnel's log-free state: bind a media
+	// client and locate the assist socket port via the relay's conn.
+	mediaClient, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mediaClient.Close() })
+	assistPort := assist.conn.LocalAddr().(*net.UDPAddr).Port
+	assistAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: assistPort}
+
+	// Drive media well past routeTTL; each packet refreshes the route.
+	buf := make([]byte, 128)
+	for i := 0; i < 8; i++ {
+		if _, err := mediaClient.WriteToUDP([]byte("keepalive"), assistAddr); err != nil {
+			t.Fatal(err)
+		}
+		_ = published.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err := published.ReadFromUDP(buf)
+		if err != nil || string(buf[:n]) != "keepalive" {
+			t.Fatalf("media stopped mid-session: n=%d err=%v", n, err)
+		}
+		time.Sleep(routeTTL / 2)
+	}
+	// A sweep now must NOT close the live session.
+	tunnel.sweepRoutes()
+	select {
+	case <-assist.closed:
+		t.Fatal("sweep closed a media-active assist relay")
+	default:
+	}
+	if _, err := mediaClient.WriteToUDP([]byte("still-alive"), assistAddr); err != nil {
+		t.Fatal(err)
+	}
+	_ = published.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := published.ReadFromUDP(buf)
+	if err != nil || string(buf[:n]) != "still-alive" {
+		t.Fatalf("media dead after sweep: n=%d err=%v", n, err)
+	}
+
+	// Go idle beyond routeTTL; the sweep must now reap route and relay.
+	time.Sleep(routeTTL * 2)
+	tunnel.sweepRoutes()
+	select {
+	case <-assist.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle assist relay was not reaped")
+	}
+	tunnel.mu.Lock()
+	_, stillRouted := tunnel.routes[9]
+	tunnel.mu.Unlock()
+	if stillRouted {
+		t.Fatal("idle route was not reaped")
+	}
+}
