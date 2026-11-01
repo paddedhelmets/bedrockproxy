@@ -22,6 +22,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -60,6 +61,14 @@ type Server struct {
 
 	sessionsMu sync.Mutex
 	sessions   map[string]*session
+
+	// NetherNet relay: TCP signaling listener on the same port, sessions keyed
+	// by ICE username and by the console address once bound.
+	tcp         net.Listener
+	http        *http.Client
+	nnMu        sync.Mutex
+	nnSessions  map[string]*nnSession
+	nnByConsole map[string]*nnSession
 
 	log *log.Logger
 }
@@ -101,14 +110,23 @@ func New(cfg Config) (*Server, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("resolve remote %q: %w", cfg.RemoteAddr, err)
 	}
+	tcp, err := net.Listen("tcp4", cfg.BindAddr)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("listen tcp %s (NetherNet signaling): %w", cfg.BindAddr, err)
+	}
 
 	return &Server{
-		cfg:      cfg,
-		conn:     conn,
-		remote:   remote,
-		serverID: rand.Int63(),
-		sessions: make(map[string]*session),
-		log:      cfg.Logger,
+		cfg:         cfg,
+		conn:        conn,
+		remote:      remote,
+		serverID:    rand.Int63(),
+		sessions:    make(map[string]*session),
+		tcp:         tcp,
+		http:        &http.Client{Timeout: signalTimeout},
+		nnSessions:  make(map[string]*nnSession),
+		nnByConsole: make(map[string]*nnSession),
+		log:         cfg.Logger,
 	}, nil
 }
 
@@ -125,6 +143,15 @@ func (s *Server) Serve(ctx context.Context) error {
 		go s.motdRefresher(ctx)
 	}
 	go s.sessionReaper(ctx)
+	go func() {
+		if err := s.serveSignaling(ctx); err != nil {
+			s.log.Printf("nethernet signaling stopped: %v", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = s.conn.Close()
+	}()
 
 	s.log.Printf("bedrockproxy up: %s -> %s (serverID=%d, proto=%s motd=%q)",
 		s.cfg.BindAddr, s.cfg.RemoteAddr, s.serverID, s.motd.ProtocolVersion, s.motd.Motd)
@@ -196,7 +223,10 @@ func (s *Server) handle(b []byte, console *net.UDPAddr, localIP net.IP, ifIndex 
 		}
 		return
 	}
-	// Anything else is connection / game traffic — relay to the remote.
+	if s.handleNetherNet(b, console) {
+		return
+	}
+	// Anything else is RakNet connection / game traffic — relay to the remote.
 	sess, err := s.getOrCreateSession(console)
 	if err != nil {
 		s.log.Printf("session %s: %v", console, err)
@@ -289,6 +319,7 @@ func (s *Server) sessionReaper(ctx context.Context) {
 				_ = sess.upstream.Close()
 				s.log.Printf("reaped idle session: %s", sess.console)
 			}
+			s.reapNetherNet()
 		}
 	}
 }
@@ -310,32 +341,16 @@ func (s *Server) motdRefresher(ctx context.Context) {
 	}
 }
 
-// refreshMotd probes the remote with an unconnected ping and stores the parsed
-// MOTD (with operator overrides and our display ports applied).
+// refreshMotd probes the remote and stores its MOTD (with operator overrides and
+// our display ports applied). It tries a RakNet unconnected ping first, then the
+// NetherNet GET /v1/join endpoint (NetherNet-only servers don't answer pings).
 func (s *Server) refreshMotd() error {
-	probe, err := net.DialUDP("udp4", nil, s.remote)
-	if err != nil {
-		return err
-	}
-	defer probe.Close()
-	if err := probe.SetReadDeadline(time.Now().Add(s.cfg.ProbeTimeout)); err != nil {
-		return err
-	}
-	if _, err := probe.Write(raknet.BuildPing(time.Now().UnixMilli(), s.serverID)); err != nil {
-		return err
-	}
-	buf := make([]byte, mtu)
-	n, err := probe.Read(buf)
-	if err != nil {
-		return err
-	}
-	pong, err := raknet.ParsePong(buf[:n])
-	if err != nil {
-		return fmt.Errorf("parse remote pong: %w", err)
-	}
-	motd := pong.Motd
-	if motd == nil {
-		motd = raknet.DefaultMotd(s.serverID)
+	motd, rakErr := s.probeRakNet()
+	if rakErr != nil {
+		var err error
+		if motd, err = s.probeJoinInfo(); err != nil {
+			return fmt.Errorf("raknet: %v; nethernet: %w", rakErr, err)
+		}
 	}
 	if s.cfg.Motd != "" {
 		motd.Motd = s.cfg.Motd
@@ -352,8 +367,39 @@ func (s *Server) refreshMotd() error {
 	motd.ServerID = strconv.FormatInt(s.serverID, 10)
 
 	s.motdMu.Lock()
+	changed := s.motd == nil || s.motd.String() != motd.String()
 	s.motd = motd
 	s.motdMu.Unlock()
-	s.log.Printf("motd refreshed: proto=%s version=%s motd=%q", motd.ProtocolVersion, motd.VersionName, motd.Motd)
+	if changed {
+		s.log.Printf("motd refreshed: proto=%s version=%s motd=%q", motd.ProtocolVersion, motd.VersionName, motd.Motd)
+	}
 	return nil
+}
+
+// probeRakNet sends the remote an unconnected ping and parses its pong MOTD.
+func (s *Server) probeRakNet() (*raknet.Motd, error) {
+	probe, err := net.DialUDP("udp4", nil, s.remote)
+	if err != nil {
+		return nil, err
+	}
+	defer probe.Close()
+	if err := probe.SetReadDeadline(time.Now().Add(s.cfg.ProbeTimeout)); err != nil {
+		return nil, err
+	}
+	if _, err := probe.Write(raknet.BuildPing(time.Now().UnixMilli(), s.serverID)); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, mtu)
+	n, err := probe.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	pong, err := raknet.ParsePong(buf[:n])
+	if err != nil {
+		return nil, fmt.Errorf("parse remote pong: %w", err)
+	}
+	if pong.Motd == nil {
+		return raknet.DefaultMotd(s.serverID), nil
+	}
+	return pong.Motd, nil
 }
