@@ -162,7 +162,9 @@ On a Pi / mini-PC on the consoles' network:
 ```
 
 Or as a systemd service (see `deploy/README.md`). LAN discovery depends on the
-client and network; console hardware validation remains outstanding.
+client and network; the Switch DNS path is validated in family production
+(2026-11-01, multiple Switches), and LAN-tunnel joins are validated on
+PC/mobile clients.
 
 ## Nintendo Switch (DNS mode)
 

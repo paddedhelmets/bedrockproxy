@@ -121,8 +121,10 @@ upstream's public ICE candidates. Tailnet-topology upstreams whose candidates
 are not client-reachable still need answer-candidate rewriting plus a media
 relay on the proxy. Clients that do their own HTTP signaling (manual server
 entry on Win/mobile) also work through the relay. The Switch featured-server
-DNS redirect path (`--dns-listen`, transport-independent) remains untested on
-hardware.
+DNS redirect path (`--dns-listen`, transport-independent) was subsequently
+validated in family production (2026-11-01): multiple Switch consoles join
+through the DNS pin and HTTP relay, minting identity assertions on the HTTP
+path with no operator intervention.
 
 Candidate implementation references include `df-mc/go-nethernet` (Go, MIT) and
 `PrismarineJS/node-nethernet` (Node, MIT). Both are active but NetherNet support
