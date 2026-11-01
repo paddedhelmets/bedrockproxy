@@ -38,10 +38,12 @@ You should see `bedrockproxy up: :19132 -> <REMOTE> ...`.
 
 ## 3. Open the firewall (if any)
 
-Allow inbound UDP 19132 on the LAN interface only:
+Allow inbound UDP **and TCP** 19132 on the LAN interface only (TCP carries the
+NetherNet signaling that Bedrock 26.60+ clients use):
 
 ```sh
 sudo ufw allow in on eth0 to any port 19132 proto udp   # adjust iface name
+sudo ufw allow in on eth0 to any port 19132 proto tcp
 ```
 
 ## 4. Join
