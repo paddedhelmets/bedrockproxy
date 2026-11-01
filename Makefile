@@ -36,6 +36,8 @@ dist:
 	    -o "dist/bedping-$${goos}-$${rest}$${ext}" ./cmd/bedping; \
 	  GOOS=$$goos GOARCH=$$goarch GOARM=$$goarm CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" \
 	    -o "dist/lanprobe-$${goos}-$${rest}$${ext}" ./cmd/lanprobe; \
+	  GOOS=$$goos GOARCH=$$goarch GOARM=$$goarm CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" \
+	    -o "dist/landial-$${goos}-$${rest}$${ext}" ./cmd/landial; \
 	done
 	@echo "--- dist/ ---" && ls -la dist
 
