@@ -39,7 +39,7 @@ func TestPickUDPv4(t *testing.T) {
 	if !ok || c.IP != "192.168.41.249" {
 		t.Fatalf("preferred pick = %+v %v", c, ok)
 	}
-	c, ok = PickUDPv4(d.Candidates, net.ParseIP("100.112.54.3"))
+	c, ok = PickUDPv4(d.Candidates, net.ParseIP("100.64.0.1"))
 	if !ok || c.IP != "172.17.0.2" {
 		t.Fatalf("fallback pick = %+v %v", c, ok)
 	}

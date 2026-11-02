@@ -26,7 +26,7 @@ which reports protocol `2169`.
   separately. The likely causes are unavailable signaling, unreachable ICE
   candidates, or a missing WebRTC UDP port.
 
-## Dad-side Checks
+## Server-side Checks
 
 Run these on the updated BDS host without restarting the world:
 
@@ -70,7 +70,7 @@ The v0.2 code adds:
 - a per-client encrypted UDP ICE relay that rewrites only candidate addresses.
 
 NetherNet mode also requires `--media-client-address` (the address visible to
-Bedrock clients) and `--media-upstream-address` (the address visible to Dad's
+Bedrock clients) and `--media-upstream-address` (the address visible to the remote
 server). `--media-bind` controls the local UDP relay socket; `:0` allocates a
 port per client, while a fixed port is useful for a one-client lab test.
 
@@ -122,7 +122,7 @@ are not client-reachable still need answer-candidate rewriting plus a media
 relay on the proxy. Clients that do their own HTTP signaling (manual server
 entry on Win/mobile) also work through the relay. The Switch featured-server
 DNS redirect path (`--dns-listen`, transport-independent) was subsequently
-validated in family production (2026-11-01): multiple Switch consoles join
+validated in production (2026-11-01): multiple Switch consoles join
 through the DNS pin and HTTP relay, minting identity assertions on the HTTP
 path with no operator intervention.
 
