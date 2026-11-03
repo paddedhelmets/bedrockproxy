@@ -1,4 +1,4 @@
-# Deploying bedrockproxy to a family LAN
+# Deploying bedrockproxy to a home LAN
 
 The proxy must run on a device **on the same LAN** as the consoles (Raspberry Pi,
 mini-PC, always-on box) for RakNet LAN discovery. NetherNet mode is a signaling

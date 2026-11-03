@@ -14,7 +14,7 @@ consoles (a Raspberry Pi, mini-PC, or always-on box). One static binary.
 
 Consoles lock Bedrock's "Servers" tab to a Microsoft-curated list. The only way
 for a Switch/PS5/Xbox to reach *your* server is via the **LAN / Friends** tab.
-BedrockTogether solves that by running on a phone on the family Wi-Fi and
+BedrockTogether solves that by running on a phone on your home Wi-Fi and
 spoofing a LAN game. `bedrockproxy` does the same job, but:
 
 - runs **persistently** on a cheap box on the LAN (no phone to keep charged/open),
@@ -55,10 +55,10 @@ RakNet, JRakNet, go-raknet, and CloudburstMC. See
 the byte-exact protocol spec.
 
 ```
- family LAN (e.g. sibling's Wi-Fi)                  internet
+ home LAN                  internet
  ──────────────────────────────────                ────────────────
  console ──UDP──> bedrockproxy:19132 ──UDP/NAT──>  remote Bedrock server
- (Switch/Xbox/PS5)  │ spoofs LAN pong              (your VPS / dad's box)
+ (Switch/Xbox/PS5)  │ spoofs LAN pong              (your VPS / remote host)
                     └ relays game datagrams both ways, per console
 ```
 
@@ -88,13 +88,13 @@ go build -o bedping ./cmd/bedping   # the ping/debug client
 ```sh
 # NetherNet signaling relay (default)
 ./bedrockproxy --protocol nethernet --bind :19132 \
-  --remote-signal-url http://dad.example.com:19132 \
+  --remote-signal-url http://mc.example.com:19132 \
   --media-bind :0 \
   --media-client-address 192.168.1.20 \
   --media-upstream-address 100.100.100.2
 
 # Legacy RakNet relay
-./bedrockproxy --protocol raknet --remote dad.example.com:19132 --motd "Granddad's World"
+./bedrockproxy --protocol raknet --remote mc.example.com:19132 --motd "Adventure Server"
 ```
 
 Flags:
@@ -151,18 +151,20 @@ missing `PROTOCOL` to RakNet for existing environment files; new example
 environment files explicitly select NetherNet. Review the environment before
 restarting, especially if replacing it with the new example.
 
-## Deploy to a family LAN (the common case)
+## Deploy to a home LAN (the common case)
 
 On a Pi / mini-PC on the consoles' network:
 
 ```sh
 # Download the matching build from https://github.com/paddedhelmets/bedrockproxy/releases
 # (or build from source: GOOS=linux GOARCH=arm64 go build .)
-./bedrockproxy --protocol raknet --remote dad.example.com:19132 --motd "Granddad's World"
+./bedrockproxy --protocol raknet --remote mc.example.com:19132 --motd "Adventure Server"
 ```
 
 Or as a systemd service (see `deploy/README.md`). LAN discovery depends on the
-client and network; console hardware validation remains outstanding.
+client and network; the Switch DNS path is validated in production
+(2026-11-01, multiple Switches), and LAN-tunnel joins are validated on
+PC/mobile clients.
 
 ## Nintendo Switch (DNS mode)
 
@@ -176,7 +178,7 @@ Run the proxy with DNS enabled (needs UDP 53; the systemd unit grants
 `CAP_NET_BIND_SERVICE`):
 
 ```sh
-sudo ./bedrockproxy --protocol raknet --remote dad.example.com:19132 --dns-listen :53
+sudo ./bedrockproxy --protocol raknet --remote mc.example.com:19132 --dns-listen :53
 ```
 
 Then point Switches at the DNS — **two ways, same proxy**:
@@ -189,7 +191,7 @@ Then point Switches at the DNS — **two ways, same proxy**:
 
 The pinned domains are the five current Bedrock featured servers (`hivebedrock.network`,
 `play.inpvp.net`, `mco.lbsg.net`, `play.galaxite.net`, `play.enchanted.gg`). If your
-family hit "Switch shows Coming Soon / can't connect", the usual culprits are IPv6
+players hit "Switch shows Coming Soon / can't connect", the usual culprits are IPv6
 bypassing the IPv4 DNS (disable IPv6 on the router, or the Switch falls back to an
 IPv6 resolver you don't control) — set the Switch's DNS explicitly as a fallback.
 
