@@ -104,7 +104,9 @@ the request path) and a direct-plus-tunneled pair both worked. The tunnel now
 gives each client a dedicated upstream listener that presents the client's own
 network ID, matching vanilla. A fresh identity needs one discovery round trip
 (~2s) before it can signal, so a client's first join is slightly slower;
-identities are kept warm for ten minutes after use.
+identities are kept warm for ten minutes after use. Confirmed on hardware
+(2026-11-26): a PC and a PS5 on separate accounts joined the same BDS
+simultaneously through the tunnel on the first attempt.
 
 ## LAN Bridge Status (2026-10-31 hardware test)
 
