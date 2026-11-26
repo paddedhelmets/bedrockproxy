@@ -8,6 +8,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,11 +16,14 @@ import (
 	"github.com/df-mc/go-nethernet/discovery"
 )
 
-// TunnelConfig configures a LAN→LAN NetherNet signaling tunnel. The bridge
+// TunnelConfig configures a LAN→LAN NetherNet signaling tunnel. The tunnel
 // republishes the upstream's own LAN advertisement on the local LAN and relays
-// signaling verbatim, so the upstream experiences a vanilla LAN join with no
-// HTTP signaling and no SDP identity assertions involved. Media flows directly
-// between the client and the upstream's advertised candidates.
+// signaling, so the upstream experiences a vanilla LAN join with no HTTP
+// signaling and no SDP identity assertions involved. Each LAN client is
+// presented upstream under its own network ID (a dedicated upstream listener
+// per client), exactly as if it had connected without a proxy; media flows
+// directly between the client and the upstream's advertised candidates unless
+// MediaAssist is enabled.
 type TunnelConfig struct {
 	// BindAddr is the downstream LAN bind (clients broadcast here; :7551).
 	BindAddr string
@@ -46,7 +50,8 @@ type TunnelConfig struct {
 // LANTunnel relays NetherNet LAN discovery and signaling between a local LAN
 // and one upstream LAN host. It is transparent to SDP contents.
 type LANTunnel struct {
-	down, up  *discovery.Listener
+	down      *discovery.Listener // LAN side: advertises, receives client signals
+	probe     *discovery.Listener // upstream side: learns the advertisement only
 	upAddr    *net.UDPAddr
 	assist    bool
 	advertise net.IP
@@ -60,14 +65,28 @@ type LANTunnel struct {
 	done   chan struct{}
 
 	mu     sync.Mutex
-	routes map[uint64]route // connection ID -> client network ID
+	routes map[uint64]route // connection ID -> owning client
 	bdsID  uint64
+	peers  map[string]*clientPeer // client network ID -> its upstream identity
 }
 
 type route struct {
 	client   string
 	lastSeen time.Time
 	assist   *assistRelay
+}
+
+// clientPeer is one LAN client's dedicated upstream identity. Signals from the
+// client are forwarded through its own discovery listener, so the upstream
+// sees a distinct peer per client. A fresh listener needs a discovery
+// response before it can signal (up to ~2s); the ordered queue absorbs that
+// delay for the client's first signals without reordering them.
+type clientPeer struct {
+	clientID string
+	l        *discovery.Listener
+	queue    chan *nethernet.Signal
+	stop     func()
+	lastSeen time.Time
 }
 
 // assistRelay forwards one connection's UDP media between the client and the
@@ -127,8 +146,12 @@ func (a *assistRelay) close() {
 }
 
 const (
-	lanTunnelMaxRoutes = 256
-	lanTunnelSweep     = 30 * time.Second
+	lanTunnelMaxRoutes       = 256
+	lanTunnelSweep           = 30 * time.Second
+	lanTunnelPeerTTL         = 10 * time.Minute
+	lanTunnelPeerQueue       = 128
+	lanTunnelForwardTimeout  = 6 * time.Second
+	lanTunnelForwardRetryGap = 100 * time.Millisecond
 )
 
 // NewLANTunnel starts the tunnel immediately. Call Close to stop it.
@@ -170,16 +193,18 @@ func NewLANTunnel(cfg TunnelConfig) (*LANTunnel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nethernet tunnel: downstream listen: %w", err)
 	}
-	up, err := (discovery.ListenConfig{BroadcastAddress: upAddr}).Listen("0.0.0.0:0")
+	// The probe only learns the upstream's advertisement. Client signaling
+	// never travels through it; each client gets a dedicated peer listener.
+	probe, err := (discovery.ListenConfig{BroadcastAddress: upAddr}).Listen("0.0.0.0:0")
 	if err != nil {
 		_ = down.Close()
-		return nil, fmt.Errorf("nethernet tunnel: upstream listen: %w", err)
+		return nil, fmt.Errorf("nethernet tunnel: upstream probe listen: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &LANTunnel{
 		down:      down,
-		up:        up,
+		probe:     probe,
 		upAddr:    upAddr,
 		assist:    cfg.MediaAssist,
 		advertise: cfg.AdvertiseIP.To4(),
@@ -191,12 +216,11 @@ func NewLANTunnel(cfg TunnelConfig) (*LANTunnel, error) {
 		cancel:    cancel,
 		done:      make(chan struct{}),
 		routes:    make(map[uint64]route),
+		peers:     make(map[string]*clientPeer),
 	}
 	stopDown := down.Notify(clientForwarder{t})
-	stopUp := up.Notify(upstreamForwarder{t})
 	go func() {
 		defer close(t.done)
-		defer stopUp()
 		defer stopDown()
 		t.learnAdvertisement()
 		learn := time.NewTicker(time.Second)
@@ -211,6 +235,7 @@ func NewLANTunnel(cfg TunnelConfig) (*LANTunnel, error) {
 				t.learnAdvertisement()
 			case <-sweep.C:
 				t.sweepRoutes()
+				t.sweepPeers()
 			}
 		}
 	}()
@@ -223,7 +248,7 @@ func (t *LANTunnel) NetworkID() string { return t.down.NetworkID() }
 
 // learnAdvertisement republishes the upstream's LAN advertisement downstream.
 func (t *LANTunnel) learnAdvertisement() {
-	responses := t.up.Responses()
+	responses := t.probe.Responses()
 	if len(responses) == 0 {
 		return
 	}
@@ -257,17 +282,98 @@ func (t *LANTunnel) upstreamID() (uint64, bool) {
 	return t.bdsID, t.bdsID != 0
 }
 
-// clientForwarder relays signals from LAN clients to the upstream.
+// peerFor returns the client's dedicated upstream identity, creating and
+// starting it on first contact. The peer presents the client's own network ID
+// upstream, as if the client had connected directly.
+func (t *LANTunnel) peerFor(clientID string) *clientPeer {
+	t.mu.Lock()
+	if p, ok := t.peers[clientID]; ok {
+		p.lastSeen = time.Now()
+		t.mu.Unlock()
+		return p
+	}
+	t.mu.Unlock()
+
+	id, err := strconv.ParseUint(clientID, 10, 64) // discovery sender IDs are numeric
+	if err != nil {
+		return nil
+	}
+	l, err := (discovery.ListenConfig{NetworkID: id, BroadcastAddress: t.upAddr}).Listen("0.0.0.0:0")
+	if err != nil {
+		t.log.Printf("nethernet lan tunnel: upstream identity for client %s: %v", clientID, err)
+		return nil
+	}
+	p := &clientPeer{clientID: clientID, l: l, queue: make(chan *nethernet.Signal, lanTunnelPeerQueue), lastSeen: time.Now()}
+	p.stop = l.Notify(peerForwarder{t: t, clientID: clientID})
+
+	t.mu.Lock()
+	if existing, ok := t.peers[clientID]; ok { // lost a creation race
+		t.mu.Unlock()
+		p.stop()
+		_ = l.Close()
+		return existing
+	}
+	t.peers[clientID] = p
+	t.mu.Unlock()
+
+	go p.run(t.ctx, t)
+	t.log.Printf("nethernet lan tunnel: client %s presents its own identity upstream", clientID)
+	return p
+}
+
+// run drains the client's signal queue in order, so an offer always precedes
+// its candidates even while the fresh listener is still learning the
+// upstream's address.
+func (p *clientPeer) run(ctx context.Context, t *LANTunnel) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case sig := <-p.queue:
+			t.forwardUpstream(p, sig)
+		}
+	}
+}
+
+func (t *LANTunnel) forwardUpstream(p *clientPeer, sig *nethernet.Signal) {
+	deadline := time.Now().Add(lanTunnelForwardTimeout)
+	for {
+		if t.ctx.Err() != nil {
+			return
+		}
+		if upID, ok := t.upstreamID(); ok {
+			err := p.l.Signal(t.ctx, &nethernet.Signal{Type: sig.Type, NetworkID: strconv.FormatUint(upID, 10), ConnectionID: sig.ConnectionID, Data: sig.Data})
+			if err == nil {
+				return
+			}
+			if t.ctx.Err() != nil {
+				return
+			}
+			// A fresh listener cannot signal until the upstream answers its
+			// first discovery request; retry briefly rather than drop.
+			if !strings.Contains(err.Error(), "no address found") || time.Now().After(deadline) {
+				t.log.Printf("nethernet lan tunnel: forward signal from client %s: %v", p.clientID, err)
+				return
+			}
+		} else if time.Now().After(deadline) {
+			t.log.Printf("nethernet lan tunnel: upstream advertisement not learned; dropping signal from client %s", p.clientID)
+			return
+		}
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-time.After(lanTunnelForwardRetryGap):
+		}
+	}
+}
+
+// clientForwarder relays signals from LAN clients to the upstream through
+// each client's dedicated identity.
 type clientForwarder struct{ t *LANTunnel }
 
 func (f clientForwarder) NotifySignal(s *nethernet.Signal) bool {
 	t := f.t
 	if len(s.Data) > maxBodySize {
-		return false
-	}
-	upID, ok := t.upstreamID()
-	if !ok {
-		t.log.Printf("nethernet lan tunnel: dropping signal from %s (upstream advertisement not learned yet)", s.NetworkID)
 		return false
 	}
 	t.mu.Lock()
@@ -290,17 +396,28 @@ func (f clientForwarder) NotifySignal(s *nethernet.Signal) bool {
 		delete(t.routes, s.ConnectionID)
 	}
 	t.mu.Unlock()
-	if err := t.up.Signal(t.ctx, &nethernet.Signal{Type: s.Type, NetworkID: strconv.FormatUint(upID, 10), ConnectionID: s.ConnectionID, Data: s.Data}); err != nil {
-		t.log.Printf("nethernet lan tunnel: forward offer-side signal from %s: %v", s.NetworkID, err)
+
+	peer := t.peerFor(s.NetworkID)
+	if peer == nil {
+		return false
 	}
-	return true
+	select {
+	case peer.queue <- &nethernet.Signal{Type: s.Type, ConnectionID: s.ConnectionID, Data: s.Data}:
+		return true
+	default:
+		t.log.Printf("nethernet lan tunnel: client %s signal queue full; dropping signal", s.NetworkID)
+		return false
+	}
 }
 
-// upstreamForwarder relays signals from the upstream to the LAN client that
-// owns the connection.
-type upstreamForwarder struct{ t *LANTunnel }
+// peerForwarder relays signals the upstream sends to one client's dedicated
+// identity back to that client.
+type peerForwarder struct {
+	t        *LANTunnel
+	clientID string
+}
 
-func (f upstreamForwarder) NotifySignal(s *nethernet.Signal) bool {
+func (f peerForwarder) NotifySignal(s *nethernet.Signal) bool {
 	t := f.t
 	if len(s.Data) > maxBodySize {
 		return false
@@ -329,7 +446,7 @@ func (f upstreamForwarder) NotifySignal(s *nethernet.Signal) bool {
 			t.log.Printf("nethernet lan tunnel: connection %d media assist failed (%v); passing answer through", s.ConnectionID, err)
 		}
 	}
-	if err := t.down.Signal(t.ctx, &nethernet.Signal{Type: s.Type, NetworkID: r.client, ConnectionID: s.ConnectionID, Data: s.Data}); err != nil {
+	if err := t.down.Signal(t.ctx, &nethernet.Signal{Type: s.Type, NetworkID: f.clientID, ConnectionID: s.ConnectionID, Data: s.Data}); err != nil {
 		t.log.Printf("nethernet lan tunnel: forward answer-side signal for connection %d: %v", s.ConnectionID, err)
 	}
 	return true
@@ -398,14 +515,45 @@ func (t *LANTunnel) sweepRoutes() {
 	}
 }
 
-// Close stops both listeners and the background loops.
+// sweepPeers retires clients that have not signaled for a while. Their
+// identities are recreated instantly (minus the discovery round trip) if they
+// return; live media through assist relays is unaffected.
+func (t *LANTunnel) sweepPeers() {
+	now := time.Now()
+	t.mu.Lock()
+	var idle []*clientPeer
+	for id, p := range t.peers {
+		if now.Sub(p.lastSeen) > lanTunnelPeerTTL {
+			delete(t.peers, id)
+			idle = append(idle, p)
+		}
+	}
+	t.mu.Unlock()
+	for _, p := range idle {
+		p.stop()
+		_ = p.l.Close()
+	}
+}
+
+// Close stops both sides of the tunnel and every client identity.
 func (t *LANTunnel) Close() error {
 	t.cancel()
-	errDown := t.down.Close()
-	errUp := t.up.Close()
 	<-t.done
+	t.mu.Lock()
+	peers := make([]*clientPeer, 0, len(t.peers))
+	for _, p := range t.peers {
+		peers = append(peers, p)
+	}
+	t.peers = make(map[string]*clientPeer)
+	t.mu.Unlock()
+	for _, p := range peers {
+		p.stop()
+		_ = p.l.Close()
+	}
+	errDown := t.down.Close()
+	errProbe := t.probe.Close()
 	if errDown != nil {
 		return errDown
 	}
-	return errUp
+	return errProbe
 }

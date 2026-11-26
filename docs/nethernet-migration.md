@@ -93,6 +93,19 @@ addition to real-client testing, future work needs to:
 - bridge LAN discovery and trickle-ICE signaling to the HTTP endpoint;
 - validate ICE routing and multihomed source addresses in the intended topology.
 
+## Per-Client Upstream Identity (2026-11-26)
+
+The LAN tunnel originally relayed every client's signaling through one shared
+upstream listener, so the BDS saw all concurrent players as a single network
+ID. WebRTC tolerates this (two sessions through one identity connect fine),
+but two real clients could not stay connected through the tunnel, while two
+clients through the HTTP relay (which carries each client's own network ID in
+the request path) and a direct-plus-tunneled pair both worked. The tunnel now
+gives each client a dedicated upstream listener that presents the client's own
+network ID, matching vanilla. A fresh identity needs one discovery round trip
+(~2s) before it can signal, so a client's first join is slightly slower;
+identities are kept warm for ten minutes after use.
+
 ## LAN Bridge Status (2026-10-31 hardware test)
 
 The experimental LAN bridge (`--lan-discover`) was validated on real clients up

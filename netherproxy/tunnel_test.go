@@ -1,8 +1,11 @@
 package netherproxy
 
 import (
+	"context"
 	"io"
 	"log"
+	"log/slog"
+	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -116,8 +119,10 @@ func TestLANTunnelRelaysDiscoveryAndSignaling(t *testing.T) {
 	if bdsSeen.ConnectionID != 42 || bdsSeen.Data != "v=0 offer-data" || bdsSeen.Type != nethernet.SignalTypeOffer {
 		t.Fatalf("BDS received %+v", bdsSeen)
 	}
-	if bdsSeen.NetworkID != tunnel.up.NetworkID() {
-		t.Fatalf("offer arrived from %s, want tunnel upstream ID %s", bdsSeen.NetworkID, tunnel.up.NetworkID())
+	// The tunnel presents the client's own identity upstream, as if the
+	// client had connected without a proxy.
+	if bdsSeen.NetworkID != client.NetworkID() {
+		t.Fatalf("offer arrived from %s, want the client's own identity %s", bdsSeen.NetworkID, client.NetworkID())
 	}
 
 	// 3. The BDS answer returns to the client.
@@ -227,8 +232,9 @@ func TestLANTunnelMediaAssistRewritesDockerCandidates(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	var bdsSeen *nethernet.Signal
 	select {
-	case <-bdsSignals:
+	case bdsSeen = <-bdsSignals:
 	case <-time.After(tunnelTestDeadline):
 		t.Fatal("BDS never received the offer")
 	}
@@ -236,7 +242,7 @@ func TestLANTunnelMediaAssistRewritesDockerCandidates(t *testing.T) {
 	// The BDS answers with an unroutable Docker-style candidate.
 	answer := "v=0\na=ice-ufrag:s\na=candidate:1 1 udp 1 172.17.0.9 " + strconv.Itoa(publishedPort) + " typ host\n"
 	if err := bds.Signal(bds.Context(), &nethernet.Signal{
-		Type: nethernet.SignalTypeAnswer, NetworkID: tunnel.up.NetworkID(),
+		Type: nethernet.SignalTypeAnswer, NetworkID: bdsSeen.NetworkID,
 		ConnectionID: 7, Data: answer,
 	}); err != nil {
 		t.Fatal(err)
@@ -365,14 +371,15 @@ func TestAssistMediaKeepsRouteAlive(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	var bdsSeen *nethernet.Signal
 	select {
-	case <-bdsSignals:
+	case bdsSeen = <-bdsSignals:
 	case <-time.After(tunnelTestDeadline):
 		t.Fatal("BDS never received the offer")
 	}
 	answer := "v=0\na=ice-ufrag:s\na=candidate:1 1 udp 1 172.17.0.9 " + strconv.Itoa(publishedPort) + " typ host\n"
 	if err := bds.Signal(bds.Context(), &nethernet.Signal{
-		Type: nethernet.SignalTypeAnswer, NetworkID: tunnel.up.NetworkID(),
+		Type: nethernet.SignalTypeAnswer, NetworkID: bdsSeen.NetworkID,
 		ConnectionID: 9, Data: answer,
 	}); err != nil {
 		t.Fatal(err)
@@ -446,5 +453,123 @@ func TestAssistMediaKeepsRouteAlive(t *testing.T) {
 	tunnel.mu.Unlock()
 	if stillRouted {
 		t.Fatal("idle route was not reaped")
+	}
+}
+
+// TestLANTunnelGivesEachClientItsOwnIdentity establishes two concurrent
+// clients through one tunnel against a BDS that accepts real WebRTC
+// connections, and verifies the BDS sees a distinct upstream identity per
+// client, equal to each client's own network ID. A single shared identity made
+// concurrent clients collide at the Bedrock session layer.
+func TestLANTunnelGivesEachClientItsOwnIdentity(t *testing.T) {
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	bdsAddr := freeUDPPort(t)
+	downAddr := freeUDPPort(t)
+
+	// The BDS: LAN discovery plus a real accepting WebRTC listener.
+	bdsSignals := make(chan *nethernet.Signal, 64)
+	bdsDisc, err := (discovery.ListenConfig{NetworkID: 424245}).Listen(bdsAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bdsDisc.Close()
+	bdsDisc.ServerData(&discovery.ServerData{
+		ServerName: "Two Peers", Protocol: 2225, Version: "1.26.61",
+		AcceptsSelfSignedAuth: true, ConnectionType: 4,
+	})
+	stopSniff := bdsDisc.Notify(captureNotifier{bdsSignals})
+	defer stopSniff()
+	// Real BDS accepts identity-less LAN offers; mirror that here.
+	bds, err := (nethernet.ListenConfig{Log: quiet, AllowAnonymous: true}).Listen(bdsDisc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bds.Close()
+
+	tunnel, err := NewLANTunnel(TunnelConfig{
+		BindAddr:     downAddr,
+		UpstreamAddr: bdsAddr,
+		Logger:       log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.Close()
+	tunnelID := mustParseID(t, tunnel.NetworkID())
+
+	// Two clients discover the tunnel through its republished advertisement.
+	type clientPeer struct {
+		l *discovery.Listener
+	}
+	var peers []clientPeer
+	for i := 0; i < 2; i++ {
+		l, err := (discovery.ListenConfig{BroadcastAddress: mustUDP(t, downAddr)}).Listen("127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		l.Notify(captureNotifier{make(chan *nethernet.Signal, 64)})
+		peers = append(peers, clientPeer{l: l})
+	}
+	deadline := time.Now().Add(tunnelTestDeadline)
+	for _, p := range peers {
+		for {
+			if _, ok := p.l.Responses()[tunnelID]; ok {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("client never discovered the tunnel")
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	// Both dial at the same time, as two consoles joining together would.
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	type result struct {
+		err  error
+		conn *nethernet.Conn
+	}
+	results := make(chan result, len(peers))
+	for _, p := range peers {
+		go func(l *discovery.Listener) {
+			d := nethernet.Dialer{Log: quiet, AllowIdentitylessServer: true, ConnectionID: rand.Uint64()}
+			conn, err := d.DialContext(ctx, tunnel.NetworkID(), l)
+			results <- result{err, conn}
+		}(p.l)
+	}
+	var conns []*nethernet.Conn
+	for range peers {
+		select {
+		case r := <-results:
+			if r.err != nil {
+				t.Fatalf("concurrent client failed through the tunnel: %v", r.err)
+			}
+			conns = append(conns, r.conn)
+		case <-time.After(30 * time.Second):
+			t.Fatal("concurrent client never connected")
+		}
+	}
+	for _, c := range conns {
+		_ = c.Close()
+	}
+
+	// The BDS must have seen one offer from each client's own identity.
+	seen := map[string]bool{}
+	for len(seen) < len(peers) {
+		select {
+		case s := <-bdsSignals:
+			if s.Type == nethernet.SignalTypeOffer {
+				seen[s.NetworkID] = true
+			}
+		case <-time.After(tunnelTestDeadline):
+			t.Fatalf("BDS saw %d distinct offering identities, want %d: %v", len(seen), len(peers), seen)
+		}
+	}
+	for i, p := range peers {
+		if !seen[p.l.NetworkID()] {
+			t.Fatalf("BDS never saw client %d's own identity %s (saw %v)", i, p.l.NetworkID(), seen)
+		}
 	}
 }
